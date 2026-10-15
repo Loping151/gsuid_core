@@ -53,8 +53,7 @@ for sv in SL.lst:
 
 命中后按类型分轨：`type == "message"`（`on_message`）另轨入队——**不挡 AI、不进 Trace、
 不调用 `count_data`**（keyword 常为 uuid4，计入命令会污染看板 / `core信息`）。其余触发器才记
-命令统计，并在存在 `command_triggers` 时跳过 AI。启动时 `purge_uuid4_command_stats` 会清掉
-历史 uuid4 伪命令行并回写 `CoreDataSummary.command`。
+命令统计，并在存在 `command_triggers` 时跳过 AI。
 
 > **权限不足 = 不匹配 → 落 AI**：若某 SV `pm=2`，而用户 `user_pm=3`（权限更低），该命令
 > "不匹配"，消息落入 AI 流程。如果该触发器声明了 `to_ai`，AI 可能尝试调它对应的工具——
