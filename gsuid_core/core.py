@@ -230,6 +230,7 @@ async def main():
         port=PORT,
         log_config=None,
         loop="asyncio",
+        ws_max_size=2**25,
     )
 
     # 设置信号处理，在收到 SIGINT/SIGTERM 时设置 shutdown_event
