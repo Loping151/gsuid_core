@@ -52,6 +52,7 @@ class TriggerIndex:
                 for trigger in bucket.values():
                     self._owner[trigger] = sv
                     self._place(trigger)
+        self._order: dict[Trigger, int] = {t: i for i, t in enumerate(self._owner)}
 
     # ---------- 建索引 ----------
 
@@ -89,7 +90,7 @@ class TriggerIndex:
     # ---------- 查询 ----------
 
     def candidates(self, ev: Event) -> list[Trigger]:
-        """本条消息的候选触发器（命中集的超集）。
+        """本条消息的候选触发器（命中集的超集，按注册顺序排列）。
 
         `to_me` 在这里先滤掉：与 `check_command` 首行同义，上提不改变判定结果。
         """
@@ -101,6 +102,7 @@ class TriggerIndex:
             if tail is not None:
                 out.extend(tail)
         out.extend(self._always)
+        out.sort(key=self._order.__getitem__)
         if ev.is_tome:
             return out
         return [t for t in out if not t.to_me]

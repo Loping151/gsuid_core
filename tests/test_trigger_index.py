@@ -257,6 +257,24 @@ def test_candidates_superset_when_is_tome(svs: list[SV]) -> None:
         assert _linear_hits(svs, ev) <= _index_candidates(index, ev), f"消息 {text!r}"
 
 
+def test_candidates_keep_registration_order(svs: list[SV]) -> None:
+    """同优先级下 handler 取第一个命中，长命令字先注册时不能被其前缀截胡。"""
+    sv = _make_sv("IxOrder", [], [], True, [("command", "导入抽卡记录"), ("command", "导入抽卡")])
+    SL.lst[sv.name] = sv
+    index = TriggerIndex()
+    for text in ("导入抽卡记录", "导入抽卡记录 abc", *_CORPUS):
+        ev = _ev(text)
+        linear = [
+            trigger
+            for _sv in SL.lst.values()
+            for bucket in _sv.TL.values()
+            for trigger in bucket.values()
+            if trigger.check_command(ev)
+        ]
+        indexed = list(dict.fromkeys(t for t in index.candidates(ev) if t.check_command(ev)))
+        assert indexed == linear, f"消息 {text!r}"
+
+
 def test_candidates_actually_narrower(svs: list[SV]) -> None:
     """索引必须真的收窄，否则等于没做。冷路径下候选应是全量的一小部分。"""
     index = TriggerIndex()
