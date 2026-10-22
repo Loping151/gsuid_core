@@ -6,6 +6,7 @@ authors = [
 license = { text = "GPL-3.0-or-later" }
 requires-python = ">=3.11,<4.0"
 dependencies = [
+    "certifi>=2026.10.19",
     "httpx>=0.23.0",
     # openai 3.x / anthropic 1.x 的 http_client 形参只收 httpx2 客户端, 与 httpx 不是同一套类
     "httpx2>=2.12.0",
@@ -13,8 +14,8 @@ dependencies = [
     "lxml>=4.9.2",
     "aiohttp>=3.8.1",
     "sqlalchemy<2.1.0,>=2.0.0",
-    # 12 起 getdata 弃用(14 移除), 仓库改用 tobytes; 下限取实测过的 12.x
-    "pillow>=12.0.0",
+    # 12 起 getdata 弃用(14 移除), 仓库改用 tobytes; 使用已验证的 Pillow 13.x
+    "pillow>=13.0.0,<14",
     "aiosqlite>=0.17.0",
     "aiofiles>=0.8.0",
     "qrcode[pil]<8.0.0,>=7.3.1",
@@ -101,3 +102,6 @@ repository = "https://github.com/Genshin-bots/gsuid-core"
 # dev 组是默认组：交付闸的 ruff / basedpyright / pytest 靠 uv sync 装齐。
 # 生产镜像与部署环境用 `uv sync --no-dev` 跳过（见 Dockerfile）。
 default-groups = ["dev"]
+
+[tool.uv.sources]
+fastembed = { path = "vendor/fastembed-0.9.0+fleet.pillow13-py3-none-any.whl" }
