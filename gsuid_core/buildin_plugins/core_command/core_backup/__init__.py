@@ -45,13 +45,14 @@ async def backup_path_files() -> int:
     凌晨自动备份`备份管理`中的路径树
     """
     CLEAN_DAY: str = log_config.get_config("ScheduledCleanLogDay").data
+    keep_days = int(backup_config.get_config("backup_keep_days").data or CLEAN_DAY)
     retcode = await backup_and_package()
     if retcode != 0:
         logger.warning(t("log.core.gscore_path_fail", retcode=retcode))
     else:
         logger.success(t("log.core.gscore_path"))
-    await asyncio.to_thread(remove_old_backups, int(CLEAN_DAY))
-    logger.success(t("log.core.clean_day_delete", CLEAN_DAY=CLEAN_DAY))
+    await asyncio.to_thread(remove_old_backups, keep_days)
+    logger.success(t("log.core.clean_day_delete", CLEAN_DAY=keep_days))
     return retcode
 
 

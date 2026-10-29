@@ -1,7 +1,7 @@
 from typing import Dict
 from pathlib import Path
 
-from .models import GSC, GsStrConfig, GsTimeRConfig, GsListStrConfig
+from .models import GSC, GsIntConfig, GsStrConfig, GsTimeRConfig, GsListStrConfig
 
 # from gsuid_core.utils.database.base_models import DB_PATH
 DB_PATH = Path(__file__).parents[3] / "data" / "GsData.db"
@@ -23,6 +23,11 @@ BACKUP_CONFIG: Dict[str, GSC] = {
         "备份目录",
         "指定需要备份的目录",
         [str(DB_PATH)],
+    ),
+    "backup_keep_days": GsIntConfig(
+        "备份保留天数",
+        "自动备份保留几天，0 为沿用日志清理天数",
+        0,
     ),
     "webdav_url": GsStrConfig(
         "WebDAV URL",

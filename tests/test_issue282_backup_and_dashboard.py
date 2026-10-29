@@ -234,6 +234,23 @@ def test_copy_error_is_not_reported_as_success(tmp_path: Path, monkeypatch) -> N
     assert [p for p in backups.iterdir() if p.is_dir()] == []
 
 
+def test_success_keeps_only_zip(tmp_path: Path, monkeypatch) -> None:
+    """打包成功后只留 zip，不再同时留一份原始目录。"""
+    root = tmp_path / "data"
+    root.mkdir()
+    src = root / "note.txt"
+    src.write_text("payload", encoding="utf-8")
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    monkeypatch.setattr("gsuid_core.utils.backup.backup_core.gs_data_path", root)
+    monkeypatch.setattr("gsuid_core.utils.backup.backup_core.backup_path", backups)
+    assert copy_and_rebase_paths([src], "case") == 0
+    zips = list(backups.iterdir())
+    assert [p.suffix for p in zips] == [".zip"]
+    with zipfile.ZipFile(zips[0]) as archive:
+        assert archive.read("note.txt") == b"payload"
+
+
 def test_failed_round_does_not_poison_the_next_read(monkeypatch) -> None:
     """上一轮查库失败不能让下一次并发的群/个人统计直接读到空图。"""
 

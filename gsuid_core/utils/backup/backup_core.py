@@ -216,6 +216,8 @@ def _copy_and_rebase_locked(
         logger.warning(t("log.backup.compress_directory_fail", e=e))
         return -10
 
+    # 备份管理只认 zip，原始目录留着就是双份占用
+    shutil.rmtree(final_backup_dir, ignore_errors=True)
     return 0
 
 
