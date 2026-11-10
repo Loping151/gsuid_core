@@ -40,10 +40,13 @@ backup_hour, backup_minute = backup_time
     hour=int(backup_hour),
     minute=int(backup_minute),
 )
-async def backup_path_files() -> int:
+async def backup_path_files(force: bool = False) -> int:
     """
     凌晨自动备份`备份管理`中的路径树
     """
+    if not force and not backup_config.get_config("backup_enable").data:
+        logger.info(t("log.core.gscore_backup_disabled"))
+        return 0
     CLEAN_DAY: str = log_config.get_config("ScheduledCleanLogDay").data
     keep_days = int(backup_config.get_config("backup_keep_days").data or CLEAN_DAY)
     retcode = await backup_and_package()
@@ -59,7 +62,7 @@ async def backup_path_files() -> int:
 @sv_core_backup.on_fullmatch("强制执行文件备份")
 async def get_fullmatch_msg(bot: Bot, ev: Event):
     await bot.send(await bot.t("♻️ 正在进行[强制执行文件备份]"))
-    retcode = await backup_path_files()
+    retcode = await backup_path_files(force=True)
     if retcode != 0:
         await bot.send(await bot.t("♻️ [强制执行文件备份] 失败"))
         return
@@ -78,16 +81,18 @@ async def database_backup():
     CLEAN_DAY: str = log_config.get_config("ScheduledCleanLogDay").data
 
     # 自选 backup_dir 已包含 GsData.db（文件本身或父目录）时不再另拷一份
-    if backup_dir_covers_path(DB_PATH):
+    if not backup_config.get_config("backup_enable").data:
+        logger.info(t("log.core.gscore_backup_disabled"))
+    elif backup_dir_covers_path(DB_PATH):
         logger.info(t("log.core.gscore_database_skip_covered"))
     else:
         await backup_file(DB_PATH, DB_BACKUP)
+        logger.success(t("log.core.gscore_database"))
     await asyncio.to_thread(clean_log)
 
     # AI 会话日志也遵循 ScheduledCleanLogDay 清理（与框架日志同一配置；0 = 不清理）
     ai_clean_days = int(CLEAN_DAY) if CLEAN_DAY and CLEAN_DAY.isdigit() else 8
     clean_old_session_logs(ai_clean_days)
-    logger.success(t("log.core.gscore_database"))
 
 
 @scheduler.scheduled_job("cron", hour=0, minute=2)

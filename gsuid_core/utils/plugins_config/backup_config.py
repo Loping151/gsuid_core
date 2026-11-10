@@ -1,13 +1,18 @@
 from typing import Dict
 from pathlib import Path
 
-from .models import GSC, GsIntConfig, GsStrConfig, GsTimeRConfig, GsListStrConfig
+from .models import GSC, GsIntConfig, GsStrConfig, GsBoolConfig, GsTimeRConfig, GsListStrConfig
 
 # from gsuid_core.utils.database.base_models import DB_PATH
 DB_PATH = Path(__file__).parents[3] / "data" / "GsData.db"
 
 
 BACKUP_CONFIG: Dict[str, GSC] = {
+    "backup_enable": GsBoolConfig(
+        "启用自动备份",
+        "关闭后每天不再自动备份数据库和备份目录，手动备份不受影响",
+        True,
+    ),
     "backup_method": GsListStrConfig(
         "备份方式",
         "指定备份方式",
