@@ -54,10 +54,13 @@ async def create_subagent(
 @ai_tools(category="self")
 async def send_message_by_ai(
     ctx: RunContext[ToolContext],
-    message_type: Literal["text", "image"],  # 消息类型
-    text: Optional[str] = None,              # 文本内容
-    image_id: Optional[str] = None,          # 图片资源ID
+    text: str = "",                          # 文本内容
+    image_ids: Optional[Union[List[str], str]] = None,  # 图片资源ID/URL（最多 9 张）
+    video_id: str = "",                      # 视频资源ID
+    audio_id: str = "",                      # 音频资源ID
     user_id: Optional[str] = None,           # 目标用户ID，默认当前对话者（§E.3）
+    image_id: Optional[Union[List[str], str]] = None,   # 兼容旧参数，等同 image_ids
+    file_ids: Optional[Union[List[str], str]] = None,   # 文件句柄（fil_/res_，最多 3 个，单文件 ≤10MB）
 ) -> str
 ```
 
@@ -274,7 +277,7 @@ async def web_fetch_tool(
 ) -> str
 ```
 
-> 默认 **Jina Reader**（`r.jina.ai`，Key 可选）+ 备用 **local** 本机直连；
+> 默认 **Jina Reader**（`r.jina.ai`，Key 可选）。可选 DeepSeek、Exa Contents、**local** 本机直连；
 > 字段 `webfetch_provider` / `webfetch_lb_strategy` / `webfetch_fallback_order` 与搜索同构。
 > 空正文或抛错会触发换源；外层 `timeout=100`。详见 [§11.3b](./11-mcp-image-search-and-meme.md)。
 > 成功返回同样前缀 `[source=web|staleness_risk=high]\n…`（时效契约同源）。
@@ -391,16 +394,10 @@ async def set_user_favorability(
 > **仅主人可用**（2026-07-08）：绝对值设定是管理动作，`check_func` 校验发起者为 master，
 > 普通用户调用返回拒绝文案。
 
-### `send_meme` — 发送表情包
+### 发表情 — 回复里的 `<meme:情绪>`
 
-```python
-@ai_tools(category="common")
-async def send_meme(
-    ctx: RunContext[ToolContext],
-    mood: Optional[str] = None,    # 情绪标签
-    scene: Optional[str] = None,   # 场景标签
-) -> str
-```
+主人格没有 `send_meme` 工具。要发表情，在回复里单独写一行 `<meme:情绪>` 或 `<meme:情绪 场景>`。
+呈现层解析标记、选图并发送。历史写成 `[表情:情绪]`。
 
 ### `collect_meme` — 收藏表情包
 
@@ -487,12 +484,47 @@ async def render_html_to_image(
     ctx: RunContext[ToolContext],
     html_content: str,
     image_format: Literal["png", "jpeg"] = "png",
-    max_width: int = 800,
+    max_width: int = 840,
 ) -> str | bytes
 ```
 
 - 默认自由 HTML；原生 `<table>` → `table_rewrite` flex 网格；自动嵌 `https`/`icon:`/`img_`/`res_`。
+- 默认逻辑宽 840，2 倍像素比出图；嵌入的位图最长边保留 1280px。全宽大图最多 3 处，整图高宽比不超过 3.8。`render_embed_images` 默认开启，关闭后不再搜图。
+- HTML 用到 `gs-` 类时，渲染前自动注入移动端组件库（`buildin_tools/render_kit.py`）：
+  外层 `<div class="gs-page layout-xxx theme-xxx">`，主题有 paper / ocean / forest / sunset / sakura /
+  violet / slate / ink。agent 自写的 `<style>` 排在组件库之后，可以覆盖。
+- 版式（`RENDER_LAYOUTS`）按内容形态选：`feature` 图文专题、`gallery` 图鉴、`magazine` 专题解读、
+  `dashboard` 数据看板、`ranking` 排行、`compare` 对比、`timeline` 时间线、`brief` 简报。
+  页头组件有 `gs-hero`（照片，`short` / `tall` / `plain`）、`gs-band`（色带）、`gs-split`（左文右图）、
+  `gs-stat-hero`（大数字）；主体另有 `gs-rank`、`gs-compare-*`、`gs-quote`、`gs-steps`、`gs-grid cols-3`。
+- 照片闸门：嵌图开启时，只有 `PHOTO_LAYOUTS`（feature / gallery / magazine）或没声明版式的 HTML
+  必须先 `find_images` 并写进 `img_`，否则拒绝渲染。其余版式照片可选。
+- 涨跌色：组件库 `--gs-up` 红、`--gs-down` 绿（`theme-ink` 用亮一档的同色相），`render_chart_spec(signed=True)` 用同一套值。
+- 图标可带颜色：`icon:mdi/map-marker?color=1d6fb8`（Iconify 出图时着色）。
 - 约束见工具 docstring、[`TAKUMI_HTML_GUIDE.md`](../../../../docs/TAKUMI_HTML_GUIDE.md)。
+
+### `find_images` — 按搜索词找配图
+
+```python
+@ai_tools(category="media", capability_domain="资料出图", code_callable=False)
+async def find_images(
+    ctx: RunContext[ToolContext],
+    queries: list[str],    # 最多 10 个，每个对象一个词，「范围词 对象名」
+    per_query: int = 2,    # 最多 4
+) -> str
+```
+
+- 只在 `render_agent` 白名单里；其他能力代理的工具回填会剔除它。
+- 来源按 `ai_config.render_image_sources` 的顺序尝试，前一个凑够张数就停：
+  - `插件图库`：插件用 `ai_image` 登记的图。向量召回后还要求查询里第一个词之后的词
+    都出现在图片描述、标签、插件名或文件名里，避免召回同插件的其他对象。
+  - `Firecrawl`：官方 `sources: images`。没填 Key 时用 v2 同步客户端走免费档，排在 Tavily 前面
+    （`Firecrawl()` / `AsyncFirecrawl()` 在 4.49.3 会先建 v1，没 Key 直接抛错）。
+  - `360`：360 图片搜索的公开接口，不需要 Key，和 Firecrawl 同属免费源。
+  - `Tavily`：配了 Tavily Key 时用 `include_images`，排在免费源后面。
+- 每张图都会下载、解码、校验尺寸（短边 ≥240、长边 ≥400、宽高比 0.4～2.8），
+  按原始字节去重，缩到最长边 1280 后登记成 `img_` 句柄（30 分钟有效）。
+- 返回每个词对应的句柄、横 / 竖 / 方、尺寸和图注；没找到时提示换词或改用图标。
 
 ### `render_chart_spec` — 声明式图表 → 内联 SVG（2026-08，2026-08-16 编码补强）
 
@@ -520,7 +552,7 @@ async def render_chart_spec(
 编码硬规则（防信息误解）：
 
 - 多实体 × 多指标：**必须** `series`（每实体一个 `name`）+ 图例。禁止把身份拍扁进单柱 label。
-- `signed` 只表达正负；系列身份不用升/降色。有负值走零轴。
+- `signed` 只表达正负（正红负绿，与组件库 `--gs-up` / `--gs-down` 同值）；系列身份不用升/降色。有负值走零轴。
 - 缺测点断线，禁止补 0。一个字段一个值，禁止把分歧来源画成未标注的两根柱。
 - 类目标签保留约 18 字。身份色避开升/降红绿。
 
@@ -653,7 +685,7 @@ async def list_available_tools(
 | `register_kanban_task` | 注册一棵任务树（根 + N 子任务节点），事件驱动并发推进 |
 | `respawn_subtask` | 复活 failed 子任务（最多 3 次后强制转 waiting_approval） |
 | `fail_task_tree` | 明确终结整棵任务树 + 级联未完成子任务 |
-| `respond_approval` | **统一审批转达工具**（`buildin_tools/approval_tools.py`）：转达用户/主人对任何待审批请求（Kanban 子任务 / 命令执行 / 工具授权等）的同意 / 拒绝，见 [§7.10](#710-审批与授权统一审批中心) |
+| `check_approval` | 查看本会话待审批的状态与剩余时间。不批准，也不返回确认码。见 [§7.10](#710-审批与授权统一审批中心) |
 | `artifact_put` / `artifact_get` / `artifact_list` | 任务树内 Artifact Hub 增 / 取 / 列 |
 | `artifact_get_recent` | 取根任务最近一份 artifact 原文，专给主人格追问溯源用 |
 
@@ -692,7 +724,7 @@ Persona 与能力代理**同构为一个 `AgentNode` 定义**（`gsuid_core.ai_c
 `capability_evaluator` 仅服务评估，插件勿覆盖。业务节点（如 `stock_agent` /
 `stock_report_agent`）由插件注册。
 
-**`render_agent`**：`tool_packs=[]` + 渲染白名单（含 **`render_chart_spec`**）；
+**`render_agent`**：`tool_packs=[]` + 渲染白名单（含 **`render_chart_spec`** / **`find_images`**）；
 runner **禁止** task 向量回填（防 web）。主人格多项数据出图委派它，勿自写 HTML。
 
 ### 7.8.1 插件创建并注册业务节点
@@ -867,9 +899,9 @@ await add_self_note(
 
 框架内所有审批（命令执行 / Kanban 子任务与插件安装 / 工具授权 / Agent 主动请求）
 统一由 `gsuid_core.ai_core.approval` 承载：一张 `AIApprovalRequest` 表 +
-`submit` / `resolve` 两个动词 + category 领域回调。三个裁决入口——对话工具
-`respond_approval`、webconsole `/api/ai/approvals/*`、Kanban 看板兼容端点——
-全部落到同一模块。
+`submit` / `resolve` 两个动词 + category 领域回调。裁决入口是私聊 6 位确认码和
+webconsole `/api/ai/approvals/*`（Kanban 看板兼容端点内部转同一函数）。
+群里说「同意」不会通过。未单独指定时限的票 10 分钟失效；命令执行沿用命令配置里的审批有效期。
 
 三种审批 =（interaction × audience）三个合法组合：
 
@@ -880,9 +912,8 @@ await add_self_note(
 | approval × master | `request_master_approval(summary)` | 敏感权限请求**主人**；永不可豁免 |
 
 三个工具 `capability_domain="审批交互"`——任何节点可经
-`tool_packs=["审批交互"]` 或 `tool_names` 挂载。转达 / 列表工具
-`respond_approval` / `list_pending_approvals` 为 buildin 保底（仅有待审批时对
-模型可见），含"用户/主人亲口表态"证据闸门，Agent 无法替人拍板。
+`tool_packs=["审批交互"]` 或 `tool_names` 挂载。`check_approval` 只在**当前会话**
+有待审批时可见，只报告状态。模型不能替主人批准。
 
 ### 7.10.1 工具策略门（推荐的接入方式）
 
@@ -895,9 +926,9 @@ async def generate_video(ctx: RunContext[ToolContext], prompt: str) -> str:
     ...
 ```
 
-调用时无有效放行 → 框架自动提交审批并拦截（返回"已提交 #xx，请转告并等回复"）；
-用户/主人经 `respond_approval` 批准后发放一次性放行 grant（10 分钟有效），Agent
-重新调用即执行。策略门在 `check_func` 之后执行，且不依赖 LLM 自觉。
+调用时无有效放行 → 框架提交审批并立刻结束本轮。主人私聊确认码或在审批中心
+批准后，框架执行提交时冻住的函数体一次，并把结果回灌进原会话。进程重启后函数体
+丢失时，才发放一次性放行，模型需要重新调用。策略门在 `check_func` 之后执行。
 
 ### 7.10.2 Python API（插件侧）
 

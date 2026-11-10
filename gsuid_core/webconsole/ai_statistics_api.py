@@ -13,6 +13,7 @@ from fastapi import Depends
 from gsuid_core.ai_core.statistics import statistics_manager
 from gsuid_core.webconsole.app_app import app
 from gsuid_core.webconsole.web_api import require_auth
+from gsuid_core.ai_core.statistics.price import calculate_model_cost
 
 from ._api_tags import AI_STATS
 
@@ -146,8 +147,16 @@ async def get_token_usage_by_range(
     获取指定时间段的 Token 消耗统计
 
     对 [start_date, end_date] 闭区间逐日聚合，返回时间段总量、按天趋势
-    以及跨天的按模型分布。今日数据取内存实时值，历史数据从数据库读取，
+    以及跨天的按模型 / 按类型分布。今日数据取内存实时值，历史数据从数据库读取，
     区间内无数据的日期以 0 补齐，保证 daily 序列连续。
+
+    三张表各发一次区间查询（BETWEEN 走 date 索引），回程行在 Python 侧按日期分组，
+    往返数与区间长度无关 —— 旧实现逐日查库，90 天档要 180 次往返。
+
+    延迟与错误也在同一份区间里返回：它们原先只存在于 /summary 的「选中日」口径，
+    看板切到 7/30 天档时会出现 Token 变了、错误率还停在某一天。latency.avg 按
+    latency_sample_count 加权，latency.p95 是区间内各日 P95 的最大值（跨日无法
+    合并成真 P95，前端按「区间内峰值」标注）。
 
     Args:
         start_date: 开始日期，格式为 "YYYY-MM-DD"，默认为 6 天前（即默认近 7 天）
@@ -155,7 +164,8 @@ async def get_token_usage_by_range(
 
     Returns:
         status: 0成功，1失败
-        data: 包含 total（总量）、daily（按天趋势）、by_model（按模型分布）的统计
+        data: 包含 total（总量）、daily（按天趋势）、by_model（按模型分布）、
+              by_type（按类型分布）、latency（区间延迟）、errors（区间错误计数）
     """
     try:
         now = datetime.now()
@@ -313,6 +323,27 @@ async def get_error_stats(
         return {"status": 1, "msg": f"未找到 {date} 日期的统计数据", "data": None}
     except Exception as e:
         return {"status": 1, "msg": f"获取错误统计失败: {str(e)}", "data": None}
+
+
+@app.get("/api/ai/statistics/error-events", summary="获取错误事件", tags=AI_STATS)
+async def get_error_events(
+    start_date: str,
+    end_date: str,
+    _: Dict[str, Any] = Depends(require_auth),
+) -> Dict[str, Any]:
+    """闭区间内的逐次错误。只有类型和消息，没有堆栈。"""
+    try:
+        from gsuid_core.ai_core.statistics.error_events import read_error_events
+
+        if not start_date or not end_date or start_date > end_date:
+            return {"status": 1, "msg": "日期范围无效", "data": []}
+        return {
+            "status": 0,
+            "msg": "ok",
+            "data": read_error_events(start_date, end_date),
+        }
+    except Exception as e:
+        return {"status": 1, "msg": f"获取错误事件失败: {str(e)}", "data": []}
 
 
 @app.get("/api/ai/statistics/heartbeat", summary="获取 Heartbeat 巡检统计", tags=AI_STATS)
@@ -478,3 +509,29 @@ async def get_statistics_history(
         return {"status": 0, "msg": "ok", "data": result}
     except Exception as e:
         return {"status": 1, "msg": f"获取历史统计失败: {str(e)}", "data": None}
+
+
+@app.get("/api/ai/statistics/estimate-cost", summary="估算单次模型调用费用", tags=AI_STATS)
+async def estimate_model_cost(
+    model: str,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    _: Dict[str, Any] = Depends(require_auth),
+) -> Dict[str, Any]:
+    """按价格表（genai-prices + 补充价目）估算一次模型调用费用。
+
+    ``data`` 为 ``{cost, currency}``，cost 单位 USD；模型查不到价目时 cost 为 0。
+    """
+    try:
+        cost = calculate_model_cost(
+            model,
+            max(0, input_tokens),
+            max(0, output_tokens),
+            max(0, cache_read_tokens),
+            max(0, cache_write_tokens),
+        )
+        return {"status": 0, "msg": "ok", "data": {"cost": cost, "currency": "USD"}}
+    except Exception as e:
+        return {"status": 1, "msg": f"估算费用失败: {str(e)}", "data": None}

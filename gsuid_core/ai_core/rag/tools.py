@@ -155,6 +155,10 @@ async def sync_tools(tools_map: Dict[str, ToolBase]) -> None:
         tools_map: 工具字典，key为工具名称，value为工具信息
     """
     from gsuid_core.ai_core.rag.base import client, embedding_model
+    from gsuid_core.ai_core.rag.tool_lexical import rebuild_index
+
+    # 词法索引与向量库无关：离线/未启用嵌入时中文工具召回仍可用。
+    rebuild_index(tools_map)
 
     if client is None or embedding_model is None:
         logger.debug(i18n_t("log.rag.tools_skip_sync_tool_ai_feature"))
@@ -342,7 +346,6 @@ GUARANTEED_TOOL_CATEGORIES: List[str] = ["self", "buildin"]
 # 插件滥用 category="self" 的不进核；检索按「本轮未暴露」召回，不再按分类一刀切。
 _SELF_CATEGORY_WHITELIST: Set[str] = {
     "send_message_by_ai",
-    "send_meme",
     "record_meme",
     "add_once_task",
     "add_interval_task",
@@ -406,29 +409,45 @@ async def align_seeds_to_context_plugin(
     plugin: str,
     query: str,
     scope: Optional["ToolScope"] = None,
+    *,
+    hard: bool = True,
 ) -> ToolList:
-    """锁定插件时丢掉其它插件的工具，并补到至多 4 个该插件工具。
+    """锁定插件时按 hard 收敛种子，并补到至多 4 个该插件工具。
 
+    hard=True（当前句点名）：丢掉其它插件的工具，撤阈值深召回补齐。
+    hard=False（背景猜测）：保留全部种子，深召回仍按正常阈值只补对口工具。
     人格作用域关掉该插件时不补。无插件工具保留。
     """
     if not plugin:
         return found
     if scope is not None and not scope.plugin_enabled(plugin):
         return [tool for tool in found if scope.tool_enabled(tool.name)]
-    kept = [tool for tool in found if _tool_plugin(tool.name) in _NEUTRAL_PLUGINS | {plugin}]
+    if hard:
+        kept = [tool for tool in found if _tool_plugin(tool.name) in _NEUTRAL_PLUGINS | {plugin}]
+    else:
+        kept = list(found)
     if scope is not None and not scope.is_open:
         kept = [tool for tool in kept if scope.tool_enabled(tool.name)]
     have = {tool.name for tool in kept}
     plugin_count = sum(1 for tool in kept if _tool_plugin(tool.name) == plugin)
     if plugin_count >= _LOCKED_PLUGIN_FILL:
         return kept
-    deep = await search_tools(
-        query=query,
-        limit=_ENTITY_ROUTE_DEEP_RECALL,
-        threshold=0.0,
-        exclude_names=have,
-        scope=scope,
-    )
+    if hard:
+        deep = await search_tools(
+            query=query,
+            limit=_ENTITY_ROUTE_DEEP_RECALL,
+            threshold=0.0,
+            exclude_names=have,
+            scope=scope,
+        )
+    else:
+        # 背景猜测只是先验：不撤阈值，只把语义对口的插件工具补进来。
+        deep = await search_tools(
+            query=query,
+            limit=_ENTITY_ROUTE_DEEP_RECALL,
+            exclude_names=have,
+            scope=scope,
+        )
     for tool in deep:
         if _tool_plugin(tool.name) != plugin or tool.name in have:
             continue
@@ -936,11 +955,10 @@ async def search_tools(
             debug=debug,
         )
     )
-    vectors = list(await embedding_model.aembed([query]))
-    if not vectors:
+    query_vec = await embedding_model.aembed_query(query)
+    if not query_vec:
         logger.warning(i18n_t("log.rag.tools_embedding_empty_result_skip"))
         return []
-    query_vec = vectors[0]
 
     async def _query_tools():
         # 如果启用 debug，使用大 limit 获取所有工具以便查看分数
@@ -1046,12 +1064,27 @@ async def search_tools(
             if not scope.tool_enabled(hidden_name):
                 del all_tools_dict[hidden_name]
 
-    # 从 all_tools_dict 中筛选出 tool_names 中的候选（保持向量分数降序）。
-    # all_tools_dict 的 value 是 ToolBase 对象（有 .tool / .description），也可能是 Tool 对象。
+    # 词法兜底：中文查询在纯英文嵌入下会退化为 [UNK]，用 CJK-2gram BM25 与
+    # Dense 名次做 RRF 融合，词面强命中可跨过 Dense 阈值进入候选。
+    from gsuid_core.ai_core.rag.tool_lexical import (
+        has_cjk,
+        rrf_fuse,
+        ensure_index,
+        lexical_scores,
+    )
+
+    ensure_index(all_tools_dict)
+    lexical = lexical_scores(query, set(all_tools_dict)) if has_cjk(query) else {}
+    if lexical:
+        fused_names = rrf_fuse(tool_names, lexical)
+    else:
+        fused_names = tool_names
     candidates: List[Tuple[str, Any, float]] = []
-    for tool_name in tool_names:
-        if tool_name in all_tools_dict:
-            candidates.append((tool_name, all_tools_dict[tool_name], score_map[tool_name]))
+    for tool_name in fused_names:
+        if tool_name not in all_tools_dict:
+            continue
+        dense_score = score_map[tool_name] if tool_name in score_map else 0.0
+        candidates.append((tool_name, all_tools_dict[tool_name], dense_score))
 
     # 二次精排：向量粗召回的候选交给 Reranker 精排，裁到 limit。
     # 未启用 Reranker 时该函数等价于"取前 limit"，与历史行为一致。

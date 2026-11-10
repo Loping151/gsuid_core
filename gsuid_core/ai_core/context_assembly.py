@@ -56,7 +56,9 @@ async def build_stable_context(event: Event, persona_name: str = "") -> str:
         from gsuid_core.ai_core.self_cognition import build_self_cognition_context
 
         # include_relationship=False：关系是 per-user，群 session 共享稳定前缀
-        return await build_self_cognition_context(bot_id=event.bot_id, scope_key=scope_key, include_relationship=False)
+        return await build_self_cognition_context(
+            bot_id=event.bot_id, persona_name=persona_name, scope_key=scope_key, include_relationship=False
+        )
 
     async def _group_profile_block() -> str:
         if not event.group_id:
@@ -220,26 +222,45 @@ async def assemble_dynamic_context(
             ctx.query,
             covered=ctx.memory_covered,
             n_doc_sources=count_document_sources(memory_text),
+            memory_intent=ctx.route_decision.memory_intent if ctx.route_decision is not None else "point_latest",
         ),
     )
     from gsuid_core.ai_core.self_cognition import load_speaker_preference_tail
 
-    tail = await load_speaker_preference_tail(bot_id, user_id)
+    tail = await load_speaker_preference_tail(bot_id, persona_name or "", user_id, existing_text=memory_text)
     if tail:
         text = f"{text}\n\n{tail}" if text else tail
     from gsuid_core.ai_core.entity_index import strip_surfaces, format_alias_bindings
     from gsuid_core.ai_core.memory.group_profile import collect_persona_surfaces
 
-    # 实体别名绑定：优先当前提问匹配；无命中时仅限紧邻的追问行继承，防止群聊误伤。
+    # 实体别名绑定：优先当前提问匹配；无命中时仅限紧邻的同说话人追问行继承，防旁人闲聊串味。
     # 叫人格名是在叫你，不是在问同名实体：先剥掉人格名和唤醒词再查别名表。
     persona_surfaces = collect_persona_surfaces(persona_name)
     alias_note = format_alias_bindings(strip_surfaces(query, persona_surfaces))
-    if not alias_note and history_context:
+    if (
+        not alias_note
+        and history_context
+        and intent != "闲聊"
+        and (
+            len(strip_surfaces(query, persona_surfaces).strip()) <= 24
+            or (ctx.turn_graph is not None and bool(ctx.turn_graph.ellipsis_followup))
+        )
+    ):
+        history_scope = (
+            history_context.split("[历史对话]", 1)[0] if "[与你的对话]" in history_context else history_context
+        )
         recent_user_lines: list[str] = []
-        for line in reversed(history_context.splitlines()):
-            if history_line_is_assistant(line) or not line.strip() or line.startswith("[历史对话]"):
+        for line in reversed(history_scope.splitlines()):
+            stripped_line = line.strip()
+            if (
+                history_line_is_assistant(stripped_line)
+                or not stripped_line
+                or stripped_line.startswith(("[历史对话]", "[与你的对话]"))
+            ):
                 continue
-            recent_user_lines.append(line)
+            if "用户ID:" in stripped_line and user_id and f"用户ID:{user_id}" not in stripped_line:
+                continue
+            recent_user_lines.append(stripped_line)
             if len(recent_user_lines) >= 2:
                 break
         if recent_user_lines:
@@ -247,6 +268,19 @@ async def assemble_dynamic_context(
     if alias_note:
         text = f"{text}\n\n{alias_note}" if text else alias_note
         logger.debug(t("log.entity_index.alias_binding_injected", note=alias_note))
+
+    if group_id:
+        from gsuid_core.ai_core.mention_resolver import resolve_mentioned_users
+
+        mention_hint = await resolve_mentioned_users(
+            query,
+            group_id=group_id,
+            current_user_id=user_id,
+            persona_name=persona_name,
+        )
+        if mention_hint:
+            text = f"{text}\n\n{mention_hint}" if text else mention_hint
+
     return text, has_actionable
 
 
@@ -267,32 +301,31 @@ def _ensure_kernel_blocks(ctx: "AgentHookContext") -> None:
         ctx.blocks["relationship"] = build_relationship_context(ctx.relationship)
     mem = ctx.retrieved["memory"] if "memory" in ctx.retrieved else ""
     if mem and "memory" not in ctx.blocks:
-        hint = "" if ctx.memory_eval else "\n（需要更多细节请调 search_cognition）"
+        hint = "\n（需要更多细节请调 search_cognition）"
         ctx.blocks["memory"] = f"{ctx.memory_guide}[长期记忆]\n{mem}{hint}"
 
 
 _ADDRESSED_FULL_BLOCKS: frozenset[str] = frozenset(
     {
         "voice_anchor",
-        "mood",
         "relationship",
         "task",
-        "plan_hint",
-        "soft_trigger",
+        "presence",
         "memory",
         "history",
+        "soft_trigger",
         "plugin_hints",
     }
 )
-# 点名 suffix 产品块合计帽。voice_anchor 与历史线程在帽外。
-_SUFFIX_PRODUCT_CAP = 400
+# 点名 suffix 产品块合计帽。history 与单独预算的 memory 在帽外。
+_SUFFIX_PRODUCT_CAP = 300
 _SUFFIX_EXEMPT_BLOCKS: frozenset[str] = frozenset({"voice_anchor", "history"})
+_CAP_EXEMPT_BLOCKS: frozenset[str] = frozenset({"voice_anchor", "history", "memory"})
 _SUFFIX_KEEP_ORDER: tuple[str, ...] = (
+    "voice_anchor",
     "task",
-    "plan_hint",
     "relationship",
-    "mood",
-    "memory",
+    "presence",
     "soft_trigger",
     "plugin_hints",
 )
@@ -301,24 +334,23 @@ _SUFFIX_KEEP_ORDER: tuple[str, ...] = (
 def suffix_allowed_blocks(ctx: "AgentHookContext") -> frozenset[str] | None:
     """群聊 suffix 允许的产品块。None = 不过滤（私聊 / 无 TurnGraph）。
 
-    未寻址轮只保留 :data:`_SUFFIX_EXEMPT_BLOCKS`（口吻锚 + 群转录）——**这两个不是
-    "被点名才给的加分项"**：口吻锚是身份连续性，群转录是"这是个群、别人在跟谁说话"
-    的唯一证据。早先这里返回空集，而 :func:`_apply_suffix_block_policy` 会先删光不在
-    ``allowed`` 里的块、豁免集却只在 ``allowed`` 非空时才补回，于是豁免机制在未寻址
-    路径上整体失效：软触发轮同时丢掉上文与人格锚，模型只剩一条光消息，只能猜指代。
+    未寻址轮保留 :data:`_SUFFIX_EXEMPT_BLOCKS`（口吻锚 + 群转录）；若本轮由软触发
+    放行，还需保留 ``soft_trigger`` 提醒，否则模型看不到「不像是对你说的就 <SILENCE>」。
     """
     tg = ctx.turn_graph
     if tg is None or not tg.is_group:
         return None
     addressed = bool(tg.call_to_self or tg.ellipsis_followup or tg.task_management)
     if not addressed:
+        if ctx.soft_triggered:
+            return _SUFFIX_EXEMPT_BLOCKS | frozenset({"soft_trigger"})
         return _SUFFIX_EXEMPT_BLOCKS
     return _ADDRESSED_FULL_BLOCKS
 
 
 def _cap_group_suffix_blocks(blocks: Dict[str, str], cap: int) -> None:
     kept: Dict[str, str] = {}
-    for name in _SUFFIX_EXEMPT_BLOCKS:
+    for name in _CAP_EXEMPT_BLOCKS:
         if name not in blocks:
             continue
         text = blocks[name].strip()
@@ -368,7 +400,9 @@ def master_title_turn_hint(ctx: "AgentHookContext") -> str:
     title = get_master_title(ctx.persona_name)
     if not title:
         return ""
-    return f"（系统：本轮说话人不是主人，禁止称「{title}」。）"
+    from gsuid_core.ai_core.control.lines import master_title_ban_line
+
+    return master_title_ban_line(title)
 
 
 def _inject_master_title_hint(ctx: "AgentHookContext") -> None:

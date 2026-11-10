@@ -17,6 +17,7 @@ CORE_DATABASE_MODEL_MODULES = (
     "gsuid_core.utils.database.models",
     "gsuid_core.utils.database.auth_models",
     "gsuid_core.utils.database.global_val_models",
+    "gsuid_core.message_history.cache",
 )
 
 AI_DATABASE_MODEL_MODULES = (
@@ -31,8 +32,8 @@ AI_DATABASE_MODEL_MODULES = (
     "gsuid_core.ai_core.approval.models",
     "gsuid_core.ai_core.budget.models",
     "gsuid_core.ai_core.memory.database.models",
-    "gsuid_core.ai_core.memory.ingestion.hiergraph",
     "gsuid_core.ai_core.meme.database_model",
+    "gsuid_core.ai_core.meme.pack_model",
     "gsuid_core.ai_core.cognition.nodes",
     "gsuid_core.ai_core.memory.ingestion.tool_trace",
 )
@@ -145,6 +146,13 @@ exec_list = [
     "ALTER TABLE aitokenusagebytype ADD COLUMN cache_write_tokens INTEGER DEFAULT 0;",
     "ALTER TABLE aitokenusagebymodel ADD COLUMN cache_read_tokens INTEGER DEFAULT 0;",
     "ALTER TABLE aitokenusagebymodel ADD COLUMN cache_write_tokens INTEGER DEFAULT 0;",
+    # 延迟样本数：区间平均延迟要按样本数加权（每日样本量实测能差两个数量级），
+    # 没有它就只能拿每日均值取算术平均。老库这一列是 0，即不参与加权。
+    "ALTER TABLE aidailystatistics ADD COLUMN latency_sample_count INTEGER DEFAULT 0;",
+    # 统计模块两张按日聚合表的 date 索引：它们是本模块唯一没有唯一约束、也就没有
+    # 附带索引的按日表，BETWEEN + ORDER BY date 原来要全表扫再排一次。
+    "CREATE INDEX IF NOT EXISTS idx_aidailystatistics_date ON aidailystatistics (date);",
+    "CREATE INDEX IF NOT EXISTS idx_airagmissstatistics_date ON airagmissstatistics (date);",
     # 小时级性能统计表 aihourlyperformance 为全新表，由 SQLModel create_all 全量
     # 建表，无需逐列 ALTER；以下仅补齐"运行过开发期中间版本（缺均值采样列）"的库
     "ALTER TABLE aihourlyperformance ADD COLUMN ttft_sum_ms FLOAT DEFAULT 0.0;",
@@ -163,6 +171,14 @@ exec_list = [
     "ALTER TABLE userfavorability ADD COLUMN daily_loss INTEGER DEFAULT 0;",
     "ALTER TABLE userfavorability ADD COLUMN daily_ymd VARCHAR DEFAULT '';",
     "ALTER TABLE userfavorability ADD COLUMN last_positive_interact_at INTEGER DEFAULT 0;",
+    # 多人格隔离：关系温度按 (user,bot,persona) 分桶 + 双边契约与私聊互惠列
+    "ALTER TABLE userfavorability ADD COLUMN persona_name VARCHAR(64) DEFAULT '';",
+    "ALTER TABLE userfavorability ADD COLUMN interaction_vibe VARCHAR(160) DEFAULT '';",
+    "ALTER TABLE userfavorability ADD COLUMN shared_callbacks TEXT DEFAULT '[]';",
+    "ALTER TABLE userfavorability ADD COLUMN last_vibe_distill_count INTEGER DEFAULT 0;",
+    "ALTER TABLE userfavorability ADD COLUMN last_proactive_dm_at INTEGER DEFAULT 0;",
+    "ALTER TABLE userfavorability ADD COLUMN dm_unanswered_streak INTEGER DEFAULT 0;",
+    "CREATE INDEX IF NOT EXISTS ix_userfavorability_persona_score ON userfavorability (persona_name, favorability);",
     # 认知节点行级属主字段，防止群内成员越权召回他人任务摘要与产物。
     "ALTER TABLE aicognode ADD COLUMN owner_user_id VARCHAR DEFAULT '';",
     "CREATE INDEX IF NOT EXISTS ix_aicognode_owner_user_id ON aicognode (owner_user_id);",
@@ -171,6 +187,19 @@ exec_list = [
     # 知识分片：chunk 0 留原文，换切法才能重切。create_all 不给旧表补列。
     "ALTER TABLE aiknowledgechunk ADD COLUMN origin TEXT DEFAULT '';",
     "ALTER TABLE aiknowledgechunk ADD COLUMN chunker_id VARCHAR(32) DEFAULT '';",
+    "ALTER TABLE aimemerecord ADD COLUMN pending_pack_id VARCHAR(36) DEFAULT '';",
+    "ALTER TABLE aimemerecord ADD COLUMN assign_default_pack BOOLEAN DEFAULT 0;",
+    # 旧库的自主行动审计没有会话号。create_all 不给已有表补列。
+    "ALTER TABLE aiautonomyactivity ADD COLUMN session_id VARCHAR(256) DEFAULT '';",
+    # 确认码审批。create_all 不给已有表补列。空哈希的旧行保持原行为。
+    "ALTER TABLE aiapprovalrequest ADD COLUMN confirm_code_hash VARCHAR(64) DEFAULT '';",
+    "ALTER TABLE aiapprovalrequest ADD COLUMN dedupe_key VARCHAR(512) DEFAULT '';",
+    "ALTER TABLE aiapprovalrequest ADD COLUMN effect TEXT DEFAULT '';",
+    "ALTER TABLE aiapprovalrequest ADD COLUMN expires_at INTEGER DEFAULT 0;",
+    "ALTER TABLE aiapprovalrequest ADD COLUMN operator_user_pm INTEGER DEFAULT 6;",
+    "CREATE INDEX IF NOT EXISTS ix_aiapprovalrequest_dedupe_key ON aiapprovalrequest (dedupe_key);",
+    "CREATE INDEX IF NOT EXISTS ix_aiapprovalrequest_expires_at ON aiapprovalrequest (expires_at);",
+    "CREATE INDEX IF NOT EXISTS ix_aiapprovalrequest_confirm_code_hash ON aiapprovalrequest (confirm_code_hash);",
 ]
 
 

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Union, Literal, Optional, Sequence
+from typing import TYPE_CHECKING, Union, Literal, Optional, Sequence
 from asyncio import Event as AsyncEvent
 from datetime import datetime
 
 from pydantic_ai.messages import UserContent, ModelMessage
+from pydantic_ai.settings import ThinkingLevel
 
 from gsuid_core.bot import Bot
 from gsuid_core.models import Event
@@ -18,6 +19,9 @@ from gsuid_core.ai_core.session_logger import AISessionLogger
 from gsuid_core.ai_core.agent_run.state import RunOnceState
 from gsuid_core.ai_core.agent_run.support import TraceKind
 from gsuid_core.ai_core.interaction_scaffold import CheapGate, TurnGraph
+
+if TYPE_CHECKING:
+    from gsuid_core.ai_core.classifier.turn_router import TurnRouteDecision
 
 ReturnMode = Literal["always", "return", "by_bot"]
 
@@ -43,18 +47,26 @@ class RunOnceHost:
     dynamic_tools: bool | None
     wall_clock_budget: float | None
     capability_node_id: str
+    thinking: ThinkingLevel | None
     turn_clock: datetime | None
+    route_decision: "TurnRouteDecision | None"
     _session_logger: AISessionLogger
     _run_sent_texts: set[str]
+    read_image_ids: set[str]
     _run_disputes: list[str]
     _last_attempt_tool_calls: list[str]
     _last_attempt_delegated_render: bool
     _last_attempt_image_sent: bool
     _last_attempt_pending_async: bool
+    _last_attempt_effectual_mutate: bool
     _last_attempt_has_status_tool: bool
     _last_attempt_thinking: str
     _session_toolset_frozen: Optional[list[str]]
     _session_appended_tools: list[str]
+    #: 上一轮 log_tools_list 记下的装配名单，tools_change 的 diff 基线
+    _last_logged_tool_names: Optional[list[str]]
+    #: 上一轮 find_tools 挂出的工具名，标 tools_change.from_find_tools 用
+    _last_run_find_tools_names: list[str]
     _cancel_generation: AsyncEvent
     _history_iter_active: bool
     _consecutive_no_tool_rounds: int
@@ -67,6 +79,8 @@ class RunOnceHost:
     _outbound_stream: bool
     #: Token 用量分类；空则用 create_by
     _stats_chat_type: str
+    #: 当轮图片 400 重试时禁用原生直投，降级走文字转述
+    _disable_direct_image_in_run: bool
 
     # ── GsCoreAIAgent 实现 ──
     def extract_history(self) -> None:
@@ -167,5 +181,6 @@ class RunOnceHost:
         turn_graph: Optional[TurnGraph] = None,
         cheap_gate: Optional[CheapGate] = None,
         is_framework_injection: bool = False,
+        injection_reason: str = "",
     ) -> object:
         raise NotImplementedError

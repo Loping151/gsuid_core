@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Tuple, Optional, Sequence
 from dataclasses import dataclass
 
 from gsuid_core.ai_core.content_guard import normalize_for_match
+from gsuid_core.ai_core.control.lines import OOC_JUDGE_MARKER, FUND_CLAIM_PREFIX, TOOL_NAME_LEAK_NUDGE
 
 # ── 分类词库 ────────────────────────────────────────────────────────
 # 规范化后匹配（吃掉"M i M o"式规避）。部署者可经 ai_config.output_firewall_extra_terms 补充。
@@ -110,7 +111,7 @@ _FRAMEWORK_LEAK_RE = re.compile(
     r"|\brender_agent\b"
     r"|\bresearch_agent\b"
     r"|\bagent_profile\s*="
-    r"|\bimage_id\s*="
+    r"|\bimage_ids?\s*="
     r"|\bres_[0-9a-fA-F]{6,}\b"
     r"|\bimg_[0-9a-fA-F]{6,}\b"
     r"|\bto_[0-9a-fA-F]{6,}\b"
@@ -520,14 +521,13 @@ NEVER_RELEASE_CATEGORIES: frozenset[str] = frozenset(
 _LAST_RESORT_SEND_ORIGINAL: frozenset[str] = frozenset({"capability_absence", "meta_narration", "stale_present"})
 #: 虚假转账与技术堆栈外泄具有直接风险，重试失败时保持沉默。
 SOFT_JUDGE_CATEGORIES: frozenset[str] = frozenset({"model_identity", "ai_selfref"})
-OOC_JUDGE_MARKER = "（系统校验：刚才要发的内容可能出戏"
 
 
 def build_rewrite_warning(hit: FirewallHit) -> str:
     """给模型的系统提醒（工具 return / 反馈注入共用）。软出戏只请模型自判，不强制改写。"""
     if hit.category == "fund_claim":
         return (
-            f"⛔ 你要发送的内容命中资金红线【命中：{'、'.join(hit.matched[:4])}】。"
+            f"{FUND_CLAIM_PREFIX}资金红线【命中：{'、'.join(hit.matched[:4])}】。"
             "你没有任何支付能力：重写时**不得声称已转账 / 已付款 / 已发红包**，"
             "也不得代任何人答应出钱或向第三方要钱——用角色口吻明确拒绝或岔开话题，"
             "直接输出重写后的内容。"
@@ -561,11 +561,7 @@ def build_rewrite_warning(hit: FirewallHit) -> str:
             "不要解释缺失的来源，禁止编造时点。直接输出重写后的正文。"
         )
     if any("框架泄漏" in m or "系统文案" in m for m in hit.matched):
-        return (
-            "（系统校验：内容可能含内部工具名 / 句柄 / 编排文案。"
-            "请判断后用角色口吻只说结论；不要对用户念工具、句柄或内部提示。"
-            "直接输出你决定发给用户的正文，不要再调用发送工具重复同一句。）"
-        )
+        return TOOL_NAME_LEAK_NUDGE
     return (
         f"{OOC_JUDGE_MARKER}【类别：{hit.category}，命中：{'、'.join(hit.matched[:4])}】。"
         "请你自己判断：介绍/对比第三方模型、聊行业新闻可以保持原意；"
@@ -576,10 +572,11 @@ def build_rewrite_warning(hit: FirewallHit) -> str:
 
 # 重说仍命中时永不放行类目保持沉默，禁止使用预设罐头文案（AGENTS.md §1.9）。
 def gate_warn_once(extra: Dict[str, Any], text: str, user_text: str = "") -> Optional[str]:
-    """工具路径发送前闸门（转发 ``output_gate.tool_gate_feedback``）。"""
+    """工具路径发送前闸门（转发 ``output_gate.tool_gate_feedback``，只回打回文案）。"""
     from gsuid_core.ai_core.output_gate import tool_gate_feedback
 
-    return tool_gate_feedback(text, extra, user_text=user_text)
+    fb, _ = tool_gate_feedback(text, extra, user_text=user_text)
+    return fb
 
 
 def scrub_or_drop(
@@ -603,6 +600,9 @@ def scrub_or_drop(
 def is_tech_dump(text: str) -> bool:
     """工具/子代理返回是否为堆栈或状态码技术 dump（供 tool return 入模前屏蔽）。"""
     if not text or not text.strip():
+        return False
+    # 认知/记忆检索的历史对话引用含用户曾粘贴的报错，不属于当前工具异常堆栈
+    if '<untrusted source="memory_recall">' in text or "【认知检索】" in text:
         return False
     if _TECH_DUMP_RE.search(_CODE_FENCE_RE.sub(" ", text)):
         return True

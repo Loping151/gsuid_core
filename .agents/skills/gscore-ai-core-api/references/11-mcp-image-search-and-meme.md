@@ -144,6 +144,8 @@ register_mcp_token_verifier(_verify_mcp_token)
 ```
 
 Claims 会写入本次 `tools/call` 的 `Event` 与 `ToolContext.extra`。
+claims 的 `auth` 为保留字段，缺省补 `"plugin"`；写成 `api_key` / `none` / `anonymous`
+会让该 token 获得 `user_id` 委托语义（见下），不要在自定义 claims 里占用。
 
 #### Event 补全器
 
@@ -154,7 +156,8 @@ Claims 会写入本次 `tools/call` 的 `Event` 与 `ToolContext.extra`。
 HTTP 头（均可选，写入 Event，无业务域语义）也可补会话，且**先于**补全器生效，补全器可覆盖：
 
 - `X-MCP-Group-Id` → `Event.group_id`
-- `X-MCP-Bot-Id` → `Event.bot_id`
+- `X-MCP-Bot-Id` → `Event.bot_id`（值含 `:` 时前段进 `bot_id`，全量进 `real_bot_id`）
+- `X-MCP-User-Id` → `Event.user_id`（委托调用方，规则见下「`user_id` 委托」）
 
 ```python
 def _enrich_mcp_event(ev: Event) -> None:
@@ -167,6 +170,23 @@ def _enrich_mcp_event(ev: Event) -> None:
 
 register_mcp_event_enricher(_enrich_mcp_event)
 ```
+
+#### `user_id` 委托（共享连接报调用方）
+
+场景：Bot / 网关用一把共享 `api_key` 连 MCP Server，插件要知道「这句是谁说的」。
+
+身份来源优先级：工具参数 `user_id` > `X-MCP-User-Id` 头 > token claims。
+
+- 生效范围：仅 `auth` 为 `api_key` / `anonymous` / `none` 的共享凭证；
+  `plugin` token 锁定 claims，两个通道都不生效
+- `X-MCP-User-Id`（可信网关断言）→ 查 `masters` / `superusers` → `user_pm` 取 `0 / 1 / 6`
+- 工具参数 `user_id`（外部 LLM 填写，可被提示词诱导）→ 与请求头不一致时固定 `user_pm=6`，不查表
+- 哨兵值（`mcp_client` / `mcp_service` / `mcp_anonymous` / 空白）视为未委托，回退 claims
+
+**工具侧 opt-in**：工具 docstring（或 `to_ai` 桥接的触发器文档）的 `Args:` 块里写
+`user_id:` 一行，MCP 导出 Schema 才会注入可选 `user_id` 参数，该行文字即参数描述；
+调用前框架把它从参数弹出写入 `ev.user_id`，不透传给插件函数。
+函数签名本身带 `user_id` 形参的工具视为查询目标参数，原样透传，不当作调用者身份。
 
 #### 工具导出过滤器
 
@@ -295,7 +315,7 @@ async def web_search_with_context(
 |--------|------|------|
 | `GsCore AI Tavily搜索配置` | `tavily_config.json` | `api_key` 池、`max_results`、`search_depth` |
 | `GsCore AI Jina搜索抓取配置` | `jina_config.json` | `api_key` 池（**搜索必填**；抓取可选）、`max_results`、`timeout`、`search_base_url`（默认 `https://s.jina.ai`）、`reader_base_url`（抓取共用） |
-| `GsCore AI Exa搜索配置` | `exa_config.json` | `api_key` 池、`max_results`、`search_type` |
+| `GsCore AI Exa搜索配置` | `exa_config.json` | `api_key` 池、`max_results`。不传 Exa `type`；文件里的 `search_type` 不读取 |
 | `GsCore AI AnySearch搜索配置` | `anysearch_config.json` | `api_key` 池（**可选**；空则匿名）、`max_results`（1–100）、`timeout`、`zone`（`cn`/`intl`，可空）、`language`（`zh-CN`/`en`，可空） |
 | `GsCore AI Firecrawl搜索配置` | `firecrawl_config.json` | `api_key` 池（**可选**；空则 keyless 免费档）、`max_results`（1–100）、`timeout` |
 
@@ -325,18 +345,20 @@ for r in results:
 ### 11.3b.1 概述
 
 `web_fetch_tool` → `gsuid_core.ai_core.web_fetch.fetch_webpage_as_markdown`。
-支持 **Jina Reader**（默认）与 **local** 本机直连，并带与搜索同构的多源策略。
+支持 **Jina Reader**（默认）、**DeepSeek**、**Exa Contents** 与 **local** 本机直连，并带与搜索同构的多源策略。
 
 | 提供方 | 端点 / 方式 | API Key |
 |--------|-------------|---------|
 | **Jina**（默认主用） | `https://r.jina.ai/{url}` | **可选**；匿名有额度，填 Key 更高 |
+| **DeepSeek** | DeepSeek Fetch API | 必填，`deepseek_config` |
+| **Exa** | `POST https://api.exa.ai/contents` | 必填，与搜索共用 `exa_config`。默认备用不含 Exa |
 | **local**（默认备用） | aiohttp 直连 + BS4/markdownify | 无；走 `web_fetch_config` 的 proxy/UA/超时 |
 
 ### 11.3b.2 配置
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `webfetch_provider` | **`Jina`** | 主用：`Jina` / `local` |
+| `webfetch_provider` | **`Jina`** | 主用：`Jina` / `DeepSeek` / `Exa` / `local` |
 | `webfetch_lb_strategy` | **`error_switch`** | 同搜索：`none` / `error_switch` / `auto_balance` |
 | `webfetch_fallback_order` | **`["local"]`** | 备用顺序；空列表运行时也回落 `["local"]` |
 | `web_fetch_config` | — | local 的 proxy / trust_env / timeout / UA / 体积上限 |
@@ -347,8 +369,8 @@ for r in results:
 内置工具外层：`web_fetch_tool` 使用 `@ai_tools(..., timeout=100.0)`。
 
 日志：开始即打
-`[WebFetch] 开始抓取 provider=Jina|local url=... (...)`，
-完成 `[WebFetch][Jina|local] 抓取完成`；失败切换见 `webfetch_provider_fail` / `webfetch_failover_ok`。
+`[WebFetch] 开始抓取 provider=Jina|DeepSeek|Exa|local url=... (...)`，
+完成 `[WebFetch][Jina|DeepSeek|Exa|local] 抓取完成`；失败切换见 `webfetch_provider_fail` / `webfetch_failover_ok`。
 
 ### 11.3b.3 使用示例
 
@@ -374,9 +396,10 @@ md = await fetch_webpage_as_markdown("https://example.com")
 
 | 工具 | category | 说明 |
 |------|----------|------|
-| `send_meme` | `buildin` | 根据情绪/场景智能选取并发送表情包 |
-| `collect_meme` | `buildin` | 手动收集表情包入库 |
-| `search_meme` | `buildin` | 搜索表情包库 |
+| `collect_meme` | `common` | 手动收集表情包入库 |
+| `search_meme` | `common` | 搜索表情包库；主人格隐藏，回想走 `search_cognition` |
+
+主人格发表情只写回复里的 `<meme:情绪>` 或 `<meme:情绪 场景>`，没有 `send_meme` 工具。
 
 三个工具的完整签名见 [§7.3 Common 工具](./07-builtin-tools.md)。
 

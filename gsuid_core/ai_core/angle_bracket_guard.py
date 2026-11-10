@@ -15,15 +15,24 @@ from __future__ import annotations
 import re
 from typing import List, Sequence
 
+from gsuid_core.ai_core.control.lines import ANGLE_NUDGE_MARKER as NUDGE_MARKER
+
 # 同一 agent.run / 同 turn 内最多打回次数（第 3 次仍失败 → 熔断）
 MAX_RETRIES = 3
 
-# 注入到 ModelRequest / 工具 return 的锚点串，便于历史裁剪精确识别
-NUDGE_MARKER = "（系统校验：发送内容含非法尖括号标签"
-
-# 协议标签：检测前剥掉；``<br>`` / ``<report>`` 不在此列
-_MEME_TAG_RE = re.compile(r"`*<meme[：:]\s*[^>]+>`*", re.IGNORECASE)
-_SILENCE_TAG_RE = re.compile(r"</?(?:SILENCE|沉默)\s*/?>", re.IGNORECASE)
+# 协议标签，检测前剥掉。<br> / <report> 不在此列。尖括号与冒号旁的空格也认。
+# 全角括号与 &lt; 同样认。捕获组是情绪正文，发送时再拆情绪和场景。
+MEME_TAG_PATTERN = re.compile(
+    r"`*(?:<|&lt;|&#60;|&#x3c;|＜|\\<)\s*"
+    r"meme\s*[：:]\s*([^>＞]+?)\s*"
+    r"(?:>|&gt;|&#62;|&#x3e;|＞|\\>)`*",
+    re.IGNORECASE,
+)
+_MEME_TAG_RE = MEME_TAG_PATTERN
+_SILENCE_TAG_RE = re.compile(
+    r"(?:<|&lt;|&#60;|＜|\\<)/?(?:SILENCE|沉默)\s*/?(?:>|&gt;|&#62;|＞|\\>)",
+    re.IGNORECASE,
+)
 
 # 与 utils._normalize_html_linebreaks 同形：教学/代码回复里的标签勿当非法
 _CODE_SPAN_RE = re.compile(r"```.*?```|`[^`\n]+`", re.DOTALL)

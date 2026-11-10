@@ -52,9 +52,11 @@ def history_to_prompt(
         for i, record in enumerate(history, 1):
             if record.role == "system" and not include_system:
                 continue
+            is_cmd = bool(record.metadata and record.metadata.get("command_hit"))
+            rec_content = "[用户调用了 bot 功能]" if is_cmd else record.content
             line = format_template.format(
                 role=record.role,
-                content=record.content,
+                content=rec_content,
                 timestamp=record.timestamp,
                 index=i,
                 user_id=record.user_id,
@@ -77,7 +79,9 @@ def history_to_prompt(
 
         if record.role == "user":
             user_label = record.user_name or record.user_id
-            lines.append(f"[用户-{user_label}]: {record.content}")
+            is_cmd = bool(record.metadata and record.metadata.get("command_hit"))
+            c_text = "[用户调用了 bot 功能]" if is_cmd else record.content
+            lines.append(f"[用户-{user_label}]: {c_text}")
         else:
             role_label = role_display.get(record.role, f"[{record.role}]")
             lines.append(f"{role_label}: {record.content}")
@@ -110,10 +114,11 @@ def history_to_messages(
         if record.role == "system" and not include_system:
             continue
 
+        c_text = "[用户调用了 bot 功能]" if (record.metadata and record.metadata.get("command_hit")) else record.content
         messages.append(
             {
                 "role": record.role,
-                "content": record.content,
+                "content": c_text,
             }
         )
 
@@ -160,7 +165,7 @@ def _merge_window() -> float:
 
 
 # 出站产物句柄。不含 to_/sa_：那些是检索落盘，不是对这个人发出去的内容。
-_THREAD_HANDLE_RE = re.compile(r"\b(?:res|img|aud|vid)_[0-9a-fA-F]{6,}\b|\bdlg_[0-9a-fA-F-]{8,}\b")
+_THREAD_HANDLE_RE = re.compile(r"\b(?:res|img|aud|vid|fil)_[0-9a-fA-F]{6,}\b|\bdlg_[0-9a-fA-F-]{8,}\b")
 SPEAKER_THREAD_LIMIT = 14
 SPEAKER_THREAD_HEADER = "[与你的对话] 旧→新"
 _OTHERS_WINDOW = 20
@@ -192,6 +197,11 @@ def _speech_channel(record: MessageRecord) -> str:
     if isinstance(raw, str) and raw:
         return raw
     return "persona"
+
+
+def is_persona_speech(record: MessageRecord) -> bool:
+    """人格自己说的话；指令回执与工具交付不算。"""
+    return record.role == "assistant" and _speech_channel(record) not in _RECEIPT_CHANNELS
 
 
 def _reply_to_uid(record: MessageRecord) -> str:
@@ -277,20 +287,39 @@ def format_history_for_agent(
                 at_key = str(at_id)
                 at_label = _user_label(at_key, name_map[at_key] if at_key in name_map else None)
                 bits.append(f"@{at_label}{AT_OTHER_MARKER}")
-        image_id = metadata.get("image_id")
-        if image_id:
-            bits.append(f"图:{image_id}")
-        for img_id in metadata.get("image_id_list", []):
-            bits.append(f"图:{img_id}")
-        audio_id = metadata.get("audio_id")
-        if audio_id:
-            bits.append(f"音频:{audio_id}")
-        file_id = metadata.get("file_id")
+        if "reply_preview" in metadata and metadata["reply_preview"]:
+            bits.append(f"↩[引用: {metadata['reply_preview']}]")
+        imgs: List[str] = []
+        if "image_id_list" in metadata and isinstance(metadata["image_id_list"], list):
+            imgs.extend(str(x) for x in metadata["image_id_list"] if x)
+        elif "image_id" in metadata and metadata["image_id"]:
+            imgs.append(str(metadata["image_id"]))
+        for img_id in imgs:
+            tag = f"[图片ID: {img_id}]"
+            if tag not in bits:
+                bits.append(tag)
+        auds: List[str] = []
+        if "audio_id_list" in metadata and isinstance(metadata["audio_id_list"], list):
+            auds.extend(str(x) for x in metadata["audio_id_list"] if x)
+        elif "audio_id" in metadata and metadata["audio_id"]:
+            auds.append(str(metadata["audio_id"]))
+        for aid in auds:
+            bits.append(f"[音频ID: {aid}]")
+        vids: List[str] = []
+        if "video_id_list" in metadata and isinstance(metadata["video_id_list"], list):
+            vids.extend(str(x) for x in metadata["video_id_list"] if x)
+        elif "video_id" in metadata and metadata["video_id"]:
+            vids.append(str(metadata["video_id"]))
+        for vid in vids:
+            bits.append(f"[视频ID: {vid}]")
+        file_id = metadata["file_id"] if "file_id" in metadata else None
         if file_id:
             bits.append(f"文件:{file_id}")
         return (" | " + " ".join(bits)) if bits else ""
 
     def _content_one_line(record: MessageRecord) -> str:
+        if record.metadata and record.metadata.get("command_hit"):
+            return "[用户调用了 bot 功能]"
         content = record.content.strip().replace("\n", " / ")
         # 句柄行不能按普通正文裁，否则 read_handle 拿到半个 id。
         if _THREAD_HANDLE_RE.search(content):
@@ -406,9 +435,16 @@ def _handle_line(handles: Sequence[str]) -> str:
     return f"{' '.join(shown)}{_HANDLE_LINE_SUFFIX}"
 
 
+def _strip_handle_from_image_tags(text: str) -> str:
+    """剥掉图片标签里的句柄后保留 `[图片·<topic>]`，空 `[图片·]` 则移除。"""
+    cleaned = _THREAD_HANDLE_RE.sub("", text)
+    cleaned = re.sub(r"\[图片·([^\]·]+?)·?\]", r"[图片·\1]", cleaned)
+    return re.sub(r"\[图片·?\]", "", cleaned)
+
+
 def _speech_residue(content: str) -> str:
     text = _THREAD_HANDLE_RE.sub("", content)
-    text = re.sub(r"\[图片[^\]]*\]", "", text)
+    text = re.sub(r"\[图片·?([^\]·]*?)·?\]", r"\1", text)
     text = text.replace(_HANDLE_LINE_SUFFIX, "")
     return re.sub(r"[\s|（）()：:，,。…·]+", "", text)
 
@@ -433,8 +469,7 @@ def assistant_visible_body(record: MessageRecord) -> Optional[str]:
     if handles and len(_speech_residue(content)) < 4:
         return _handle_line(handles)
     if handles:
-        speech = _THREAD_HANDLE_RE.sub("", content)
-        speech = re.sub(r"\[图片[^\]]*\]", "", speech)
+        speech = _strip_handle_from_image_tags(content)
         speech = re.sub(r"\s+", " ", speech).strip(" |")
         if speech:
             return f"{speech} | {_handle_line(handles)}"
@@ -491,13 +526,24 @@ def materialize_speaker_thread(records: Sequence[MessageRecord]) -> List[Message
     return out
 
 
+def format_private_recent_history(records: Sequence[MessageRecord]) -> str:
+    """私聊冷启动时格式化最近历史记录。"""
+    if not records:
+        return ""
+    return format_history_for_agent(
+        list(records),
+        block_header="[近期私聊记录] 旧→新",
+        content_limit=200,
+    )
+
+
 def compose_group_history(
     records: Sequence[MessageRecord],
     *,
     current_user_id: str,
     current_user_name: Optional[str] = None,
 ) -> str:
-    """同人线程在前。旁人块是他人 user 句，外加没有收件人的出站。"""
+    """同人线程在前。旁人块是他人 user 句，外加发给他人或无收件人的出站。"""
     if not records:
         return ""
     uid = str(current_user_id)
@@ -526,11 +572,13 @@ def compose_group_history(
 
 
 def _group_timeline(records: Sequence[MessageRecord], uid: str) -> List[MessageRecord]:
-    """没有收件人的出站留在群时间线，不记到最近一个插话者头上。"""
+    """发给别人的出站与无收件人出站留在群时间线，发给当前说话人的归同人线程。"""
     recent = list(records)[-_OTHERS_WINDOW:]
     users = [r for r in recent if r.role == "user" and str(r.user_id) != uid]
     loose = [
-        r for r in recent if r.role == "assistant" and not _reply_to_uid(r) and assistant_visible_body(r) is not None
+        r
+        for r in recent
+        if r.role == "assistant" and not _assistant_belongs_to_speaker(r, uid) and assistant_visible_body(r) is not None
     ]
     merged = users + materialize_speaker_thread(loose)
     merged.sort(key=lambda record: record.timestamp)

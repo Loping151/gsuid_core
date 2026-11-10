@@ -29,8 +29,8 @@ class CogKind(str, Enum):
     OUTBOUND = "outbound"
 
 
-# 工具回执里单条片段正文上限。专名要留下，邻条闲聊不要整段摊开。
-EPISODE_BODY_BUDGET = 240
+# 工具回执里单条片段正文上限。专名和句末补充常在第 300+ 字符，不能按 240 截断。
+EPISODE_BODY_BUDGET = 1200
 
 # 面向模型的中文标签（进 prompt 的那一份）
 KIND_LABEL: Dict[CogKind, str] = {
@@ -57,7 +57,7 @@ WORK_KINDS: FrozenSet[CogKind] = frozenset({CogKind.TOOL_OUTPUT, CogKind.ARTIFAC
 MEDIA_KINDS: FrozenSet[CogKind] = frozenset({CogKind.IMAGE, CogKind.MEME})
 ALL_KINDS: FrozenSet[CogKind] = frozenset(CogKind)
 # 工具未声明 kinds 时的默认面：记忆+知识+落盘。图片/表情/出站/业务记录须显式打开。
-DEFAULT_RECALL_KINDS: FrozenSet[CogKind] = MEMORY_KINDS | KNOWLEDGE_KINDS | WORK_KINDS
+DEFAULT_RECALL_KINDS: FrozenSet[CogKind] = MEMORY_KINDS | KNOWLEDGE_KINDS | WORK_KINDS | frozenset({CogKind.SELF_NOTE})
 # query 点名当前说话人 ID：只查身上的记忆（片段+实体+事实+偏好）。
 # 不开放知识库/落盘/近窗。近窗只在 DEFAULT_RECALL_KINDS ⊆ kinds 时开，加 EPISODE 不会误开。
 SPEAKER_RECALL_KINDS: FrozenSet[CogKind] = frozenset(
@@ -84,6 +84,8 @@ class CogScope:
     memory_eval: bool = False
     # 评测 HTTP clock_at。None=检索用墙上时钟；禁止从用户原文解析。
     clock_at: Optional[datetime] = None
+    # 当前说话的人格。空字符串表示这次检索不按包过滤出图（调用方应传空序列，而不是 None）。
+    persona_name: str = ""
 
     @property
     def is_private(self) -> bool:

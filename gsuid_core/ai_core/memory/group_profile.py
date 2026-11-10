@@ -10,7 +10,7 @@
 state_key 为记忆系统的 scope_key（如 "group:929275476"）。
 """
 
-from typing import Any, Dict, List, Sequence, TypedDict
+from typing import Dict, List, Sequence, TypedDict
 from datetime import datetime
 
 from gsuid_core.i18n import t as i18n_t
@@ -28,6 +28,14 @@ _MAX_MEMBER_ALIASES = 60
 _MAX_IDS_PER_ALIAS = 5
 
 
+class PendingTerm(TypedDict):
+    """待定别名映射：满 2 个不同批次出现才转正为正式 term_mapping。"""
+
+    formal: str
+    hits: int
+    last_batch_id: str
+
+
 class GroupProfileData(TypedDict):
     """群组画像的结构化数据。
 
@@ -37,14 +45,15 @@ class GroupProfileData(TypedDict):
     scope_key: str
     tag_counts: Dict[str, int]  # {标签: 累计出现频次}
     term_mappings: Dict[str, str]  # {别名: 正式名称}
+    pending_terms: Dict[str, PendingTerm]  # {别名: 待定映射}
     # 群成员称呼映射 {称呼: [用户ID, ...]}；新版本使用 member_alias_ids 列表字段。
     member_alias_ids: Dict[str, List[str]]
     # 遗留字段：旧版 {称呼: 用户ID(str)}。**永不读取**，仅原样透传保留以便回滚；新逻辑只认上面的字段。
-    member_aliases: Any
+    member_aliases: object
     last_updated: str  # ISO 时间字符串，空串表示尚未写入
 
 
-def _coerce_member_alias_ids(raw: Any) -> Dict[str, List[str]]:
+def _coerce_member_alias_ids(raw: object) -> Dict[str, List[str]]:
     """规整 member_alias_ids 字段为 {称呼: [用户ID, ...]}。
 
     本字段只由新逻辑以列表形式写入；这里**不迁移**老字段、不解析旧格式，仅对新字段做防御性解析
@@ -73,10 +82,28 @@ def _coerce_member_alias_ids(raw: Any) -> Dict[str, List[str]]:
     return out
 
 
-def _normalize(raw: Any, scope_key: str) -> GroupProfileData:
+def _coerce_pending_terms(raw: object) -> Dict[str, PendingTerm]:
+    """规整 pending_terms 字段。"""
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, PendingTerm] = {}
+    for alias, val in raw.items():
+        if not isinstance(alias, str) or not alias:
+            continue
+        if not isinstance(val, dict):
+            continue
+        formal = val["formal"] if "formal" in val and isinstance(val["formal"], str) else ""
+        hits = val["hits"] if "hits" in val and isinstance(val["hits"], int) else 1
+        last_batch = val["last_batch_id"] if "last_batch_id" in val and isinstance(val["last_batch_id"], str) else ""
+        if formal:
+            out[alias] = PendingTerm(formal=formal, hits=hits, last_batch_id=last_batch)
+    return out
+
+
+def _normalize(raw: object, scope_key: str) -> GroupProfileData:
     """将 state_store 读出的原始值规整为 GroupProfileData。
 
-    state_store 的值是任意 JSON（静态类型 Any），可能为 None、旧版结构或损坏数据，
+    state_store 的值是任意 JSON（静态类型 object），可能为 None、旧版结构或损坏数据，
     因此逐字段用 isinstance 守卫取值，而非直接信任其形状。
     """
     if not isinstance(raw, dict):
@@ -84,12 +111,14 @@ def _normalize(raw: Any, scope_key: str) -> GroupProfileData:
             scope_key=scope_key,
             tag_counts={},
             term_mappings={},
+            pending_terms={},
             member_alias_ids={},
             member_aliases={},
             last_updated="",
         )
     raw_tags = raw["tag_counts"] if "tag_counts" in raw else None
     raw_terms = raw["term_mappings"] if "term_mappings" in raw else None
+    raw_pending = raw["pending_terms"] if "pending_terms" in raw else None
     raw_alias_ids = raw["member_alias_ids"] if "member_alias_ids" in raw else None
     # 旧字段原样透传：永不读取/解析，仅保留以便回滚（见 GroupProfileData.member_aliases 说明）
     legacy_aliases = raw["member_aliases"] if "member_aliases" in raw else {}
@@ -98,6 +127,7 @@ def _normalize(raw: Any, scope_key: str) -> GroupProfileData:
         scope_key=scope_key,
         tag_counts=raw_tags if isinstance(raw_tags, dict) else {},
         term_mappings=raw_terms if isinstance(raw_terms, dict) else {},
+        pending_terms=_coerce_pending_terms(raw_pending),
         member_alias_ids=_coerce_member_alias_ids(raw_alias_ids),
         member_aliases=legacy_aliases,
         last_updated=raw_updated if isinstance(raw_updated, str) else "",
@@ -112,14 +142,14 @@ async def get_group_profile(scope_key: str) -> GroupProfileData:
     return _normalize(raw, scope_key)
 
 
-def _as_profile(current: Any, scope_key: str) -> GroupProfileData:
+def _as_profile(current: object, scope_key: str) -> GroupProfileData:
     """把 state_mutate 传入的当前值规整为完整 profile 结构并刷新更新时间。"""
     profile = _normalize(current, scope_key)
     profile["last_updated"] = datetime.now().isoformat(timespec="seconds")
     return profile
 
 
-async def record_term_mappings(scope_key: str, mappings: Dict[str, str]) -> None:
+async def record_term_mappings(scope_key: str, mappings: Dict[str, str], batch_id: str = "") -> None:
     """记录一批别名 → 正式名称的映射到群组画像。
 
     通过 state_store 的 state_mutate 乐观锁完成读-改-写，避免并发摄入时
@@ -133,16 +163,34 @@ async def record_term_mappings(scope_key: str, mappings: Dict[str, str]) -> None
         return
     from gsuid_core.ai_core.state_store import state_mutate
 
-    def _mutate(current: Any) -> GroupProfileData:
+    def _mutate(current: object) -> GroupProfileData:
         profile = _as_profile(current, scope_key)
         term_mappings: Dict[str, str] = dict(profile["term_mappings"])
+        pending_terms: Dict[str, PendingTerm] = dict(profile["pending_terms"])
         for alias, formal in mappings.items():
-            if alias and formal:
-                term_mappings[alias] = formal
+            if not alias or not formal:
+                continue
+            if alias in term_mappings and term_mappings[alias] == formal:
+                continue
+            if alias in pending_terms and pending_terms[alias]["formal"] == formal:
+                pending = pending_terms[alias]
+                if batch_id and pending["last_batch_id"] != batch_id:
+                    pending["hits"] += 1
+                    pending["last_batch_id"] = batch_id
+                elif not batch_id:
+                    pending["hits"] += 1
+                if pending["hits"] >= 2:
+                    term_mappings[alias] = formal
+                    pending_terms.pop(alias, None)
+            else:
+                pending_terms[alias] = PendingTerm(formal=formal, hits=1, last_batch_id=batch_id)
         # 容量控制：超限时丢弃最早写入的映射
         if len(term_mappings) > _MAX_TERM_MAPPINGS:
             term_mappings = dict(list(term_mappings.items())[-_MAX_TERM_MAPPINGS:])
+        if len(pending_terms) > _MAX_TERM_MAPPINGS:
+            pending_terms = dict(list(pending_terms.items())[-_MAX_TERM_MAPPINGS:])
         profile["term_mappings"] = term_mappings
+        profile["pending_terms"] = pending_terms
         return profile
 
     await state_mutate(_PROFILE_SCOPE, scope_key, _mutate)
@@ -165,7 +213,7 @@ async def record_entity_tags(scope_key: str, tags: List[str]) -> None:
 
     from gsuid_core.ai_core.state_store import state_mutate
 
-    def _mutate(current: Any) -> GroupProfileData:
+    def _mutate(current: object) -> GroupProfileData:
         profile = _as_profile(current, scope_key)
         tag_counts: Dict[str, int] = dict(profile["tag_counts"])
         for t in meaningful:
@@ -183,6 +231,42 @@ async def get_term_mappings(scope_key: str) -> Dict[str, str]:
     """获取群组的词汇映射表。"""
     profile = await get_group_profile(scope_key)
     return profile["term_mappings"]
+
+
+async def get_scope_summary(scope_key: str, limit: int = 8) -> str:
+    """零 LLM 群摘要：活跃故事线标题 + 最近里程碑事实。"""
+    from gsuid_core.ai_core.memory.database.models import AIMemEdge, AIMemThread
+
+    if not scope_key:
+        return ""
+    threads = await AIMemThread.list_active(scope_key, limit=limit)
+    if not threads:
+        return ""
+    lines: list[str] = []
+    for th in threads:
+        lines.append(f"- {th.title or '未命名故事线'}")
+        milestones = await AIMemEdge.list_thread_milestones(scope_key, th.id, limit=3, ascending=False)
+        for edge in milestones:
+            lines.append(f"  · {edge.fact[:80]}")
+    return "\n".join(lines)
+
+
+async def clear_learned_terms() -> int:
+    """schema_v2 迁移：清空历史学到的词表 / 待定词 / 标签频次。"""
+    from gsuid_core.ai_core.state_store import state_mutate, state_list_keys
+
+    keys = await state_list_keys(_PROFILE_SCOPE)
+    for key in keys:
+
+        def _mutate(current: object) -> GroupProfileData:
+            profile = _as_profile(current, key)
+            profile["term_mappings"] = {}
+            profile["pending_terms"] = {}
+            profile["tag_counts"] = {}
+            return profile
+
+        await state_mutate(_PROFILE_SCOPE, key, _mutate)
+    return len(keys)
 
 
 async def record_member_alias(scope_key: str, alias: str, user_id: str) -> List[str]:
@@ -210,7 +294,7 @@ async def record_member_alias(scope_key: str, alias: str, user_id: str) -> List[
         return []
     from gsuid_core.ai_core.state_store import state_mutate
 
-    def _mutate(current: Any) -> GroupProfileData:
+    def _mutate(current: object) -> GroupProfileData:
         profile = _as_profile(current, scope_key)
         alias_ids: Dict[str, List[str]] = dict(profile["member_alias_ids"])
         # 本次绑定置顶、去重，旧绑定保留在后——既支持现场纠正（最近的排最前作首选），
@@ -225,7 +309,7 @@ async def record_member_alias(scope_key: str, alias: str, user_id: str) -> List[
         profile["member_alias_ids"] = alias_ids
         return profile
 
-    new_profile = await state_mutate(_PROFILE_SCOPE, scope_key, _mutate)
+    new_profile: GroupProfileData = await state_mutate(_PROFILE_SCOPE, scope_key, _mutate)
     result = new_profile["member_alias_ids"].get(alias, [user_id])
     logger.debug(
         i18n_t(
@@ -264,7 +348,7 @@ def expand_query_with_aliases(query: str, term_mappings: Dict[str, str]) -> str:
         return query
     appended: List[str] = []
     for alias, formal in term_mappings.items():
-        if alias and alias in query and formal and formal not in query:
+        if alias and len(alias) >= 2 and alias in query and formal and formal not in query:
             appended.append(formal)
     if not appended:
         return query

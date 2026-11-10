@@ -9,15 +9,18 @@ from typing import Any, Optional, Sequence
 from dataclasses import replace
 
 from pydantic_ai import RunContext
+from pydantic_ai.tools import Tool
 
 from gsuid_core.i18n import t
 from gsuid_core.logger import logger
 from gsuid_core.ai_core.models import ToolContext
 from gsuid_core.ai_core.register import ai_tools
 from gsuid_core.ai_core.rag.tools import search_tools, search_tools_by_domain
+from gsuid_core.ai_core.control.lines import FIND_TOOLS_GAP_NOTE
 from gsuid_core.ai_core.buildin_tools.visibility import (
     check_sched_create,
     check_sched_mutate,
+    mark_find_tools_recalled,
 )
 from gsuid_core.ai_core.buildin_tools.find_tools_rank import (
     RankedHit,
@@ -31,10 +34,87 @@ from gsuid_core.ai_core.buildin_tools.find_tools_rank import (
 )
 
 FIND_TOOLS_LOADED_KEY = "find_tools_last_loaded"
-FIND_TOOLS_GAP_NOTE = (
-    "（系统：连续检索未暴露新工具。下一动：改 need 再检索，或委派通用调研。"
-    "禁止对用户讲检索过程、禁止念工具名、禁止说成「你要的东西不存在」。）"
-)
+
+
+def _registry_identity_names(need: str, rows: Sequence[tuple[str, str]]) -> list[str]:
+    """need 是工具名、插件名、前缀，或首词/子串含完整工具名时，返回这些工具名。"""
+    needle = need.strip()
+    if not needle:
+        return []
+    if any(ch.isspace() for ch in needle):
+        low = needle.lower()
+        tokens = [tok.strip("`'\"()[]{}，。：；、") for tok in low.split() if tok]
+        return [name for name, _plugin in rows if "_" in name and (name.lower() in tokens or name.lower() in low)]
+    if any(name == needle for name, _plugin in rows):
+        return [needle]
+    plugin_hits = [name for name, plugin in rows if plugin == needle]
+    if plugin_hits:
+        return plugin_hits
+    grouped: dict[str, list[str]] = {}
+    for name, plugin in rows:
+        if plugin and name.startswith(needle):
+            grouped.setdefault(plugin, []).append(name)
+    if len(grouped) != 1:
+        return []
+    plugin = next(iter(grouped))
+    if not needle.startswith(plugin):
+        return []
+    return grouped[plugin]
+
+
+def _read_video_requested(need: str) -> bool:
+    """是否在找读视频。不看模型有没有声明 video。"""
+    n = (need or "").strip()
+    if not n:
+        return False
+    low = n.lower()
+    if "read_video" in low or "vid_" in low:
+        return True
+    from gsuid_core.ai_core.register import find_tool_base
+
+    tb = find_tool_base("read_video")
+    if tb is not None and need_matches_tool_text(n, tb.retrieval_text, list(tb.covers)):
+        return True
+    if "视频" not in n:
+        return False
+    return any(mark in n for mark in ("看", "读", "播", "内容", "什么", "描述", "分析", "讲"))
+
+
+def _read_video_tool(need: str) -> Tool[ToolContext] | None:
+    if not _read_video_requested(need):
+        return None
+    from gsuid_core.ai_core.register import find_tool_base
+
+    tb = find_tool_base("read_video")
+    if tb is None:
+        return None
+    return tb.tool
+
+
+def _identity_tools(need: str) -> list[Tool[ToolContext]]:
+    # capability_map 已把名字交给模型。向量库缺这个点时，按名字仍要挂上。
+    from gsuid_core.ai_core.register import get_all_tools
+
+    tools = get_all_tools()
+    rows = [(tb.name, tb.plugin) for tb in tools.values()]
+    out: list[Tool[ToolContext]] = []
+    for name in _registry_identity_names(need, rows):
+        out.append(tools[name].tool)
+    return out
+
+
+def _prepend_tools(
+    pinned: Sequence[Tool[ToolContext]],
+    found: Sequence[Tool[ToolContext]],
+) -> list[Tool[ToolContext]]:
+    seen = {tool.name for tool in pinned}
+    out: list[Tool[ToolContext]] = list(pinned)
+    for tool in found:
+        if tool.name in seen:
+            continue
+        seen.add(tool.name)
+        out.append(tool)
+    return out
 
 
 def _record_find_tools_round(extra: dict[str, Any], loaded: list[str]) -> bool:
@@ -116,8 +196,9 @@ def _node_on_topic(need: str, node_id: str) -> bool:
 
 
 def nodes_with_keyword_hit(need: str) -> list[str]:
-    """match_keywords 出现在 need 里的节点（不含 persona / 评估器）。"""
+    """match_keywords 或节点自描述特征出现在 need 里的节点（不含 persona / 评估器）。"""
     from gsuid_core.ai_core.agent_node import list_nodes
+    from gsuid_core.ai_core.buildin_tools.find_tools_rank import common_keyword_stems
 
     blob = (need or "").strip().lower()
     if not blob:
@@ -126,11 +207,26 @@ def nodes_with_keyword_hit(need: str) -> list[str]:
     for node in list_nodes():
         if node.source == "persona" or node.node_id == "capability_evaluator":
             continue
+        matched = False
         for kw in node.match_keywords:
             k = (kw or "").strip().lower()
             if k and k in blob:
                 hits.append(node.node_id)
+                matched = True
                 break
+        if matched:
+            continue
+        dn = (node.display_name or "").strip().lower()
+        if len(dn) >= 2 and dn in blob:
+            hits.append(node.node_id)
+            continue
+        stems = common_keyword_stems(node.match_keywords)
+        if any(stem in blob for stem in stems):
+            hits.append(node.node_id)
+            continue
+        nid_stem = node.node_id.split("_")[0].lower()
+        if len(nid_stem) >= 3 and nid_stem in blob:
+            hits.append(node.node_id)
     return hits
 
 
@@ -193,6 +289,31 @@ async def _matched_capability_node_ids(need: str, *, limit: int = 5) -> list[str
         if hit:
             _push(node.node_id)
     return ids
+
+
+def _apply_mcp_tool_quota(hits: list[RankedHit]) -> tuple[list[RankedHit], list[str]]:
+    """同一 MCP server 直调工具最多 2 个；命中时返回其能力节点 id（必入专用档）。"""
+    from gsuid_core.ai_core.register import find_tool_base
+    from gsuid_core.ai_core.agent_node.registry import owning_nodes_of_tools
+
+    groups: dict[str, list[RankedHit]] = {}
+    for hit in hits:
+        tb = find_tool_base(hit.name)
+        if tb is not None and tb.plugin.startswith("mcp_"):
+            groups.setdefault(tb.plugin, []).append(hit)
+    if not groups:
+        return hits, []
+    drop: set[str] = set()
+    node_ids: list[str] = []
+    for group in groups.values():
+        top = sorted(group, key=lambda h: h.score, reverse=True)
+        drop.update(h.name for h in top[2:])
+        owners = owning_nodes_of_tools([h.name for h in top[:2]])
+        for ids in owners.values():
+            for node_id in ids:
+                if node_id not in node_ids:
+                    node_ids.append(node_id)
+    return [h for h in hits if h.name not in drop], node_ids
 
 
 def _offered_dedicated_hits(
@@ -290,6 +411,7 @@ async def find_tools(
     """列表没有的能力必须先调：用一句话描述所缺能力。未调用前禁止说做不到/没装。
 
     每次都会检索，不因列表里已有工具而跳过。已暴露且真正对口的专用工具并入回执。
+    need 等于已注册工具名，或等于插件名（工具名前缀）时，直接挂上该工具。
     一次返回专用能力 / 专用工具 / 通用能力 / 通用工具；有专用项时禁止改用通用项。
     专用工具下一步可直接调；专用能力用 create_subagent(agent_profile=node_id)。
 
@@ -319,30 +441,59 @@ async def find_tools(
         visible_offered_set = set(visible_offered)
         offered_hits = [h for h in offered_hits if h.name in visible_offered_set]
 
-        family_tools = await search_tools_by_domain(
-            query=need,
-            domain_limit=3,
-            per_domain_limit=6,
-            exclude_names=offered_set,
-            scope=ctx.deps.tool_scope,
-        )
+        pinned = _identity_tools(need)
+        if _scope is not None and not _scope.is_open:
+            pinned = [tool for tool in pinned if _scope.tool_enabled(tool.name)]
+        video_tool = _read_video_tool(need)
+        if video_tool is not None:
+            # 未声明 video 时通道核里的 schema 是藏着的，召回后本轮要真正可调。
+            mark_find_tools_recalled(ctx.deps, "read_video")
+            pinned = _prepend_tools([video_tool], pinned)
+        identity_names = {tool.name for tool in pinned}
+
+        try:
+            family_tools = await search_tools_by_domain(
+                query=need,
+                domain_limit=3,
+                per_domain_limit=6,
+                exclude_names=offered_set,
+                scope=ctx.deps.tool_scope,
+            )
+        except RuntimeError as e:
+            if not pinned:
+                logger.warning(t("log.ai.find_tools_feature_enabled", e=e))
+                return "⚠️ 工具检索功能未启用，无法动态加载工具。"
+            family_tools = []
         from gsuid_core.ai_core.rag.tools import align_seeds_to_context_plugin
-        from gsuid_core.ai_core.entity_index import ALIAS_ROUTE_TEXT_KEY, ALIAS_PLUGIN_EXTRA_KEY
+        from gsuid_core.ai_core.entity_index import (
+            ALIAS_ROUTE_TEXT_KEY,
+            ALIAS_PLUGIN_EXTRA_KEY,
+            ALIAS_PLUGIN_EXPLICIT_EXTRA_KEY,
+        )
 
         _alias_plugin = ""
         if ALIAS_PLUGIN_EXTRA_KEY in ctx.deps.extra:
             _raw_plugin = ctx.deps.extra[ALIAS_PLUGIN_EXTRA_KEY]
             if isinstance(_raw_plugin, str):
                 _alias_plugin = _raw_plugin
+        _alias_hard = False
+        if ALIAS_PLUGIN_EXPLICIT_EXTRA_KEY in ctx.deps.extra:
+            _raw_explicit = ctx.deps.extra[ALIAS_PLUGIN_EXPLICIT_EXTRA_KEY]
+            if isinstance(_raw_explicit, bool):
+                _alias_hard = _raw_explicit
         _route = need
         if ALIAS_ROUTE_TEXT_KEY in ctx.deps.extra:
             _raw_route = ctx.deps.extra[ALIAS_ROUTE_TEXT_KEY]
             if isinstance(_raw_route, str) and _raw_route.strip():
                 _route = _raw_route.strip()
+        merged = _prepend_tools(pinned, family_tools)
         if _alias_plugin:
-            family_tools = await align_seeds_to_context_plugin(family_tools, _alias_plugin, _route, ctx.deps.tool_scope)
+            merged = await align_seeds_to_context_plugin(
+                merged, _alias_plugin, _route, ctx.deps.tool_scope, hard=_alias_hard
+            )
         if _scope is not None and not _scope.is_open:
-            family_tools = [t for t in family_tools if _scope.tool_enabled(t.name)]
+            merged = [tool for tool in merged if _scope.tool_enabled(tool.name)]
+        family_tools = merged
         dedicated_tools: list[RankedHit] = list(offered_hits)
         generic_tools: list[RankedHit] = []
         fold_names: list[str] = []
@@ -365,7 +516,7 @@ async def find_tools(
                 # 向量已召回；词面过滤会丢掉「对比表出成图」这类 exclusive
                 fold_names.append(tool.name)
                 continue
-            if not need_matches_tool_text(need, retrieval, covers):
+            if tool.name not in identity_names and not need_matches_tool_text(need, retrieval, covers):
                 continue
             try:
                 run_ctx = replace(
@@ -389,6 +540,10 @@ async def find_tools(
                 label=tool_brief(covers=covers, description=tb.description),
                 score=score,
             )
+            # 已在通道核但被 visible_when 藏住时，仍要写进回执；通用档会被专用项丢掉。
+            if tool.name == "read_video" or tool.name in identity_names:
+                dedicated_tools.append(hit)
+                continue
             if tier == "dedicated":
                 dedicated_tools.append(hit)
             elif tool.name not in offered_set:
@@ -417,7 +572,7 @@ async def find_tools(
                 continue
             if not _node_on_topic(need, node_id):
                 continue
-            if _alias_plugin and not _node_plugin_ok(node_id, _alias_plugin):
+            if _alias_hard and _alias_plugin and not _node_plugin_ok(node_id, _alias_plugin):
                 continue
             hit = _node_hit(node_id, float(2000 - idx))
             if hit is not None:
@@ -428,7 +583,7 @@ async def find_tools(
                 continue
             if not _node_on_topic(need, node_id):
                 continue
-            if _alias_plugin and not _node_plugin_ok(node_id, _alias_plugin):
+            if _alias_hard and _alias_plugin and not _node_plugin_ok(node_id, _alias_plugin):
                 continue
             hit = _node_hit(node_id, float(1500 - idx))
             if hit is not None:
@@ -470,17 +625,30 @@ async def find_tools(
             if hit is not None:
                 generic_agents.append(hit)
 
+        dedicated_tools, mcp_owner_ids = _apply_mcp_tool_quota(dedicated_tools)
+        for idx, node_id in enumerate(mcp_owner_ids):
+            if not agent_is_dedicated(node_id):
+                continue
+            if any(a.name == node_id for a in dedicated_agents):
+                continue
+            hit = _node_hit(node_id, float(1900 - idx))
+            if hit is not None:
+                dedicated_agents.append(hit)
+
         plan = build_find_tools_plan(
             dedicated_agents=dedicated_agents,
             dedicated_tools=dedicated_tools,
             generic_agents=generic_agents,
             generic_tools=generic_tools,
+            pinned_names=tuple(identity_names),
         )
         if plan.is_empty():
             _record_capability_gap(need)
             stale_empty = _record_find_tools_round(ctx.deps.extra, [])
             miss = f"⚠️ 本次没有对口的专用能力（{need}）。可换更具体的能力描述重试，或委派通用调研。"
-            return f"{miss}\n{FIND_TOOLS_GAP_NOTE}" if stale_empty else miss
+            if stale_empty:
+                return f"{miss}\n{FIND_TOOLS_GAP_NOTE}"
+            return miss
 
         loaded_names = plan.loadable_tool_names()
         ctx.deps.dynamic_tool_names.update(loaded_names)
@@ -515,19 +683,23 @@ async def capability_map(
     """列出我（及可委派代理）的全部能力目录（不含参数细节）。
 
     每行：工具名 — 覆盖场景一句话，按能力域分组。需要细节再用 find_tools 查具体工具。
+    「可委派代理」段列出能力代理节点——它们持有的专属工具不在工具表里（已被剥离），
+    只能用 create_subagent(agent_profile=node_id) 调用，所以必须能在这里查到。
     单次最多 60 行；超出请按 domain/plugin 过滤再查。
 
     Args:
         ctx: 工具执行上下文。
         scope: all / domain / plugin。
-        filter: 按能力域或插件名过滤。
+        filter: 按能力域、插件名、工具名或能力代理（node_id / 名称 / 用途）过滤。
     """
-    _ = ctx
     from gsuid_core.ai_core.register import get_all_tools, main_persona_roster_ok
+    from gsuid_core.ai_core.agent_node.models import AgentNode
+    from gsuid_core.ai_core.agent_node.registry import list_persona_capability_nodes
+    from gsuid_core.ai_core.buildin_tools.subagent import _caller_persona_name
 
+    needle = (filter or "").strip().lower()
     tools = get_all_tools()
     grouped: dict[str, list[str]] = {}
-    needle = (filter or "").strip().lower()
     for _name, tb in tools.items():
         if tb is None or not main_persona_roster_ok(tb):
             continue
@@ -547,20 +719,35 @@ async def capability_map(
         elif tb.description:
             cover = tb.description.split("\n", 1)[0][:40]
         grouped.setdefault(domain, []).append(f"{tb.name}：{cover}")
-    if not grouped:
+    agents: list[str] = []
+    caller_persona = _caller_persona_name(ctx)
+    for node in list_persona_capability_nodes(caller_persona or None):
+        tools_part = " ".join(node.tool_names) if isinstance(node, AgentNode) else ""
+        node_hay = f"{node.node_id} {node.display_name} {node.when_to_use} {tools_part}".lower()
+        if needle and needle not in node_hay:
+            continue
+        when = (node.when_to_use or "").strip() or node.display_name
+        for sep in ("；", ";", "（", "(", "。"):
+            when = when.split(sep, 1)[0]
+        agents.append(f"- `{node.node_id}`：{when.strip() or node.display_name}")
+    if not grouped and not agents:
         return "目录为空。换 filter 或 scope 再查。"
-    if scope == "all":
+    if scope == "all" and not needle:
         lines = [f"【{domain}】 {len(rows)} 项" for domain, rows in sorted(grouped.items())]
+        if agents:
+            lines.append(f"【可委派代理】 {len(agents)} 项")
         lines.append("展开用 scope=domain 加 filter。")
         return "\n".join(lines)
     lines: list[str] = []
+    if agents:
+        lines.append("【可委派代理】用 create_subagent(agent_profile=node_id) 调用")
+        lines.extend(agents)
     for domain in sorted(grouped):
         lines.append(f"【{domain}】")
         lines.extend(f"- {row}" for row in grouped[domain])
-        if len(lines) >= 60:
-            lines = lines[:60]
-            lines.append("（超出 60 行，请用 scope=domain/plugin 加 filter 再查）")
-            break
+    if len(lines) > 60:
+        lines = lines[:60]
+        lines.append("（超出 60 行，请用 scope=domain/plugin 加 filter 再查）")
     return "\n".join(lines)
 
 

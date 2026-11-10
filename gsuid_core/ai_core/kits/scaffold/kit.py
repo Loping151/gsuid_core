@@ -41,7 +41,7 @@ class ScaffoldKit(AgentKit):
                 if rec.role == "assistant":
                     last_had_tick = reply_ends_with_tone_marker(rec.content or "", markers)
                     break
-            quota = "（口癖配额：每3–5条至多1条带语气词结尾；其余条不带。）"
+            quota = "（口癖配额：每3–5条至多1条带角色专属口癖词；日常口语助词如啦/呀/呢/吧/嘛自然使用。）"
             if last_had_tick:
                 quota += "上一条已带口癖，本条禁带。"
             style = resolve_chat_style(ctx.persona_name)
@@ -49,15 +49,18 @@ class ScaffoldKit(AgentKit):
                 "chitchat_style",
                 f"（若纯寒暄：建议不超过 {style.soft} 字/条，至多 {style.bubbles} 条；若需查数/办事仍调工具。）{quota}",
             )
-        # 私聊 FULL 一律催工具。群聊问答/工具，或办事/查数；不认单独的「看看这」。
-        from gsuid_core.ai_core.interaction_scaffold import looks_like_committed_work
-
-        q = ctx.query or ""
-        need_tools = (not is_group) or ctx.intent in ("工具", "问答") or looks_like_committed_work(q)
+        # 私聊 FULL 一律催工具；群聊看路由结论（工具/问答或明确委托事务）。
+        need_tools = (
+            (not is_group)
+            or ctx.intent in ("工具", "问答")
+            or bool(ctx.route_decision is not None and ctx.route_decision.needs_committed_work)
+        )
         if need_tools and not ctx.memory_eval:
+            from gsuid_core.ai_core.prompt_group.store import render_prompt
+
             ctx.set_context_block(
                 "transaction_priority",
-                "（本轮有实际事务，优先调工具完成；困/懒/麻烦不是跳过理由。）",
+                render_prompt(ctx.persona_name, "transaction_priority"),
             )
         if ctx.recent_report_titles:
             titles = "、".join(ctx.recent_report_titles[-3:])

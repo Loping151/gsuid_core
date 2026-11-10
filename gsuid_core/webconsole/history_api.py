@@ -8,13 +8,16 @@ History Manager APIs
 仅会跳过 AI 会话相关的增强信息（如 AI 会话对象、persona 等）。
 """
 
+import base64
 from typing import Any, Dict, List, Tuple, Optional
 
 from fastapi import File, Form, Depends, UploadFile
+from fastapi.responses import Response, RedirectResponse
 
 from gsuid_core.message_history import get_history_manager
 from gsuid_core.webconsole.app_app import app
 from gsuid_core.webconsole.web_api import require_auth
+from gsuid_core.utils.resource_manager import RM
 
 from ._api_tags import HISTORY
 
@@ -214,8 +217,39 @@ async def get_session_history(
 
         # 根据格式类型返回不同格式的数据
         if format_type == "json":
-            # 原始JSON格式
-            messages = [record.to_dict() for record in history]
+            # 补全历史图片信息
+            messages = []
+            for record in history:
+                rec_dict = record.to_dict()
+                meta = rec_dict.get("metadata")
+                if isinstance(meta, dict):
+                    # 若无 images 字段，尝试从 RM 或 image_id/image_id_list 补全
+                    if not meta.get("images"):
+                        recovered: List[str] = []
+                        img_ids: List[str] = []
+                        if isinstance(meta.get("image_id_list"), list):
+                            img_ids.extend([str(i) for i in meta["image_id_list"] if i])
+                        if meta.get("image_id") and str(meta["image_id"]) not in img_ids:
+                            img_ids.append(str(meta["image_id"]))
+
+                        for i_id in img_ids:
+                            try:
+                                val = RM.peek(i_id)
+                                if isinstance(val, str) and val.startswith(("http://", "https://")):
+                                    recovered.append(val.strip())
+                                else:
+                                    recovered.append(f"/api/history/resource/{i_id}")
+                            except Exception:
+                                recovered.append(f"/api/history/resource/{i_id}")
+
+                        if recovered:
+                            meta["images"] = recovered
+                            # 回写至内存对象，避免反复 peek
+                            if hasattr(record, "metadata") and isinstance(record.metadata, dict):
+                                record.metadata["images"] = recovered
+
+                messages.append(rec_dict)
+
             return {
                 "status": 0,
                 "msg": "ok",
@@ -486,6 +520,111 @@ async def get_history_stats(_: Dict[str, Any] = Depends(require_auth)) -> Dict[s
             "msg": f"获取统计信息失败: {str(e)}",
             "data": None,
         }
+
+
+# 别让浏览器把 octet-stream 猜成 HTML —— 这条路由吐的是用户消息里的原始字节
+_NO_SNIFF = {"X-Content-Type-Options": "nosniff"}
+
+
+def _sniff_media_type(data: bytes) -> str:
+    """按文件头判断 MIME。"""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data.startswith(b"BM"):
+        return "image/bmp"
+    if data[:4] == b"RIFF":
+        sub = data[8:12]
+        if sub == b"WEBP":
+            return "image/webp"
+        if sub == b"WAVE":
+            return "audio/wav"
+        if sub == b"AVI ":
+            return "video/x-msvideo"
+    if data.startswith(b"#!AMR"):
+        return "audio/amr"
+    if data.startswith((b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")):
+        return "audio/mpeg"
+    if data.startswith(b"OggS"):
+        return "audio/ogg"
+    if data[4:8] == b"ftyp":
+        return "video/mp4"
+    if data.startswith(b"\x1a\x45\xdf\xa3"):
+        return "video/webm"
+    if data.startswith(b"FLV"):
+        return "video/x-flv"
+    return "application/octet-stream"
+
+
+@app.get("/api/history/resource/{resource_id}", summary="获取历史消息引用的图片资源", tags=HISTORY)
+async def get_history_resource(resource_id: str):
+    """根据 resource_id 获取图片，直链 302 重定向，二进制按流返回。"""
+    data = None
+    try:
+        data = RM.peek(resource_id)
+    except Exception:
+        pass
+
+    # 若 RM 中不存在，尝试在 history_manager 内存记录中查找匹配的 metadata.images
+    if data is None:
+        try:
+            manager = get_history_manager()
+            for hist in manager._histories.values():
+                for msg in hist:
+                    meta = msg.metadata if isinstance(msg.metadata, dict) else {}
+                    ids = meta.get("image_id_list") or []
+                    if meta.get("image_id"):
+                        ids = list(ids) + [meta.get("image_id")]
+                    if resource_id in ids:
+                        images = meta.get("images") or []
+                        idx = ids.index(resource_id) if resource_id in ids else 0
+                        if idx < len(images):
+                            data = images[idx]
+                            break
+                if data is not None:
+                    break
+        except Exception:
+            pass
+
+    if data is None:
+        return Response(status_code=404)
+
+    # 1. 如果是 http/https URL，直接 302 重定向
+    if isinstance(data, str) and data.startswith(("http://", "https://")):
+        return RedirectResponse(url=data, status_code=302)
+
+    # 2. 如果是 base64 / dataURI
+    if isinstance(data, str):
+        media_type = ""
+        raw_b64 = data
+        if raw_b64.startswith("data:"):
+            header, _, body = raw_b64.partition(",")
+            raw_b64 = body
+            if ";" in header:
+                declared = header.split(";")[0].removeprefix("data:").strip().lower()
+                if declared.startswith(("image/", "audio/", "video/")):
+                    media_type = declared
+        elif raw_b64.startswith("base64://"):
+            raw_b64 = raw_b64.removeprefix("base64://")
+
+        try:
+            img_bytes = base64.b64decode(raw_b64)
+            return Response(
+                content=img_bytes,
+                media_type=media_type or _sniff_media_type(img_bytes),
+                headers=_NO_SNIFF,
+            )
+        except Exception:
+            return Response(status_code=500)
+
+    # 3. 如果是 bytes
+    if isinstance(data, bytes):
+        return Response(content=data, media_type=_sniff_media_type(data), headers=_NO_SNIFF)
+
+    return Response(status_code=404)
 
 
 @app.post("/api/history/{session_id}/send", summary="向指定 Session 发送消息", tags=HISTORY)

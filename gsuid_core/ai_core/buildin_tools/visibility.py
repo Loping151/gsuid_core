@@ -88,6 +88,27 @@ def visible_to_capability_only(ctx: RunContext[ToolContext]) -> bool:
 SCHED_CREATE_OK_KEY = "sched_create_ok"
 SCHED_MUTATE_OK_KEY = "sched_mutate_ok"
 MODEL_DECLARES_VIDEO_KEY = "model_declares_video"
+FIND_TOOLS_RECALLED_KEY = "find_tools_recalled"
+
+
+def mark_find_tools_recalled(deps: ToolContext, name: str) -> None:
+    """find_tools 点名召回后，本轮不再被 visible_when 藏住。"""
+    extra = deps.extra
+    raw = extra[FIND_TOOLS_RECALLED_KEY] if FIND_TOOLS_RECALLED_KEY in extra else None
+    names: list[str] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str) and item not in names:
+                names.append(item)
+    if name not in names:
+        names.append(name)
+    extra[FIND_TOOLS_RECALLED_KEY] = names
+
+
+def find_tools_recalled(deps: ToolContext, name: str) -> bool:
+    extra = deps.extra
+    raw = extra[FIND_TOOLS_RECALLED_KEY] if FIND_TOOLS_RECALLED_KEY in extra else None
+    return isinstance(raw, list) and name in raw
 
 
 def sched_tool_visibility(
@@ -163,24 +184,19 @@ def visibility_user_hint(
     if not addressed:
         return ""
     if not create_ok:
-        return "（系统：本轮是管理已有条目：不要新建，用查询/修改/取消。）"
+        from gsuid_core.ai_core.control.lines import VISIBILITY_MANAGE_EXISTING
+
+        return VISIBILITY_MANAGE_EXISTING
     return ""
 
 
 def visible_when_timeline_query(ctx: VisibilityScanCtx) -> bool:
-    """排序/摘要/时间线问句才暴露 search_turns / read_session / timeline。"""
-    from gsuid_core.ai_core.memory.retrieval.lexical import strip_clock_lines
-    from gsuid_core.ai_core.memory.retrieval.event_time import (
-        looks_like_span_query,
-        looks_like_order_query,
-        looks_like_summary_query,
-    )
-
-    for text in _iter_context_texts(ctx):
-        body = strip_clock_lines(text or "")
-        if looks_like_order_query(body) or looks_like_span_query(body) or looks_like_summary_query(body):
-            return True
-    return False
+    """排序/摘要/版本对比问句才暴露 search_turns / read_session / timeline。"""
+    deps = ctx.deps
+    if deps is None or "memory_intent" not in deps.extra:
+        return False
+    memory_intent = deps.extra["memory_intent"]
+    return isinstance(memory_intent, str) and memory_intent in ("version_diff", "timeline_order", "broad_summary")
 
 
 def context_has_image(ctx: VisibilityScanCtx) -> bool:
@@ -198,9 +214,11 @@ def context_has_image(ctx: VisibilityScanCtx) -> bool:
 
 
 def context_has_video(ctx: VisibilityScanCtx) -> bool:
-    """``read_video``：有视频句柄且当前模型声明 video 才暴露。"""
+    """有视频且模型声明 video 才默认暴露。find_tools 召回后本轮保持可见。"""
     deps = ctx.deps
     if deps is None:
+        return True
+    if find_tools_recalled(deps, "read_video"):
         return True
     extra = deps.extra
     if MODEL_DECLARES_VIDEO_KEY in extra and extra[MODEL_DECLARES_VIDEO_KEY] is False:

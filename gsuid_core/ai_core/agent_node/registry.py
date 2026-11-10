@@ -205,7 +205,8 @@ def list_persona_capability_nodes(persona_name: str | None) -> list[AgentNode]:
 
 def format_capability_roster(persona_name: str | None = None) -> str:
     """可委派短花名册：每节点一行 node_id + when_to_use。covers 不进 system。"""
-    nodes: list[AgentNode] = list_persona_capability_nodes(persona_name)
+    # in_roster=False（如 MCP 节点）仍可被路由/委派，只是不写进花名册文案。
+    nodes: list[AgentNode] = [n for n in list_persona_capability_nodes(persona_name) if n.in_roster]
     from gsuid_core.ai_core.configs.ai_config import ai_config
 
     cap = int(ai_config.get_config("capability_roster_line_max").data)
@@ -229,13 +230,9 @@ def format_capability_roster(persona_name: str | None = None) -> str:
         lines.append(line)
     if not lines:
         return ""
-    return (
-        "（可用能力代理——须 "
-        '`create_subagent(agent_profile="<node_id>", task=...)` 委派，'
-        "agent_profile 只填下列 node_id，禁止自造名字：\n"
-        + "\n".join(lines)
-        + "\n提醒的增删改查在主会话；禁止声称没有对应工具。）"
-    )
+    from gsuid_core.ai_core.prompt_group.store import render_prompt
+
+    return render_prompt(persona_name, "roster_wrap", lines="\n".join(lines))
 
 
 def owning_nodes_of_tools(tool_names: List[str]) -> Dict[str, List[str]]:
@@ -286,7 +283,7 @@ def match_capability_node(hint: str) -> str:
                 best_id = node.node_id
         # 弱匹配：when_to_use / display_name / node_id 出现在 hint 中（低于关键词分）
         weak_blob = f"{node.node_id} {node.display_name} {node.when_to_use}".lower()
-        for token in h.replace("，", " ").replace(",", " ").split():
+        for token in re.split(r"[\s,，、；;。！？!?/|]+", h):
             if len(token) < 2:
                 continue
             if token in weak_blob:

@@ -115,6 +115,7 @@ _413_TEXT_MARKERS: tuple[str, ...] = (
     "request body too large",
     "context length",
     "too many tokens",
+    "larger than allowed",
 )
 
 
@@ -626,6 +627,13 @@ class _EmbeddingModelWrapper:
         """
         results = await self._provider.embed(texts)
         return iter(results)
+
+    async def aembed_query(self, text: str) -> list[float]:
+        """在线检索的单条查询嵌入。
+
+        批量池默认单 worker，后台切块索引会占满它；查询走单条池，不排在索引后面。
+        """
+        return await self._provider.embed_single(text)
 
     @property
     def provider(self) -> EmbeddingProvider:

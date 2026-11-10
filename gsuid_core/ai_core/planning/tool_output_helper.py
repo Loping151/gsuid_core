@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 import asyncio
 import hashlib
@@ -34,6 +35,7 @@ _TTL_DAYS = 30
 # 自适应折叠：私聊 / 群聊 / 能力代理
 _FOLD_PRIVATE = 1200
 _FOLD_GROUP = 900
+_FOLD_CAPABILITY = 12000
 # 折叠卡内嵌要点上限（仅私聊；群聊主人格只留 summary，不当事实总线）
 _INLINE_HEAD_PRIVATE = 1400
 # 只读/回读类：内容已在 artifact/FileOS 真身里，禁止再落一份 tool_output
@@ -65,7 +67,9 @@ def content_sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def fold_threshold(*, is_group: bool = False) -> int:
+def fold_threshold(*, is_group: bool = False, is_capability: bool = False) -> int:
+    if is_capability:
+        return _FOLD_CAPABILITY
     return _FOLD_GROUP if is_group else _FOLD_PRIVATE
 
 
@@ -96,15 +100,16 @@ def should_fold_for_model(
     *,
     tool_name: str = "",
     is_group: bool = False,
+    is_capability: bool = False,
 ) -> bool:
-    """主人格折叠门：句柄卡 / 只读工具 / 过短不折。长委派回执同样折成卡。"""
+    """折叠门：句柄卡 / 只读工具 / run_code / 过短不折。"""
     tn = (tool_name or "").strip()
-    if tn in _SKIP_PERSIST_TOOLS:
+    if tn in _SKIP_PERSIST_TOOLS or tn == "run_code":
         return False
     body = (content or "").strip()
     if looks_like_handle_card(body):
         return False
-    return len(body) >= fold_threshold(is_group=is_group)
+    return len(body) >= fold_threshold(is_group=is_group, is_capability=is_capability)
 
 
 def _scope_from_ev(ev: Optional[Event]) -> tuple[str, str, str]:
@@ -143,11 +148,25 @@ def _searchish_tool(name: str) -> bool:
     return is_searchish_tool(name)
 
 
+def _persona_name_for_session(session_id: str) -> str:
+    """折叠卡读者的人格名；查不到返回空串（按默认全开口径）。"""
+    sid = (session_id or "").strip()
+    if not sid:
+        return ""
+    from gsuid_core.ai_core.session_registry import get_ai_session_registry
+
+    sess = get_ai_session_registry().get_ai_session(sid)
+    if sess is None:
+        return ""
+    return str(sess.persona_name or "")
+
+
 def fold_card_for_main_prompt(
     card: PersistedHandleCard,
     *,
     content: str,
     is_group: bool,
+    render_allowed: bool = True,
 ) -> PersistedHandleCard:
     """群聊：summary + 句柄，无 inline。私聊：可带要点供当面问答。"""
     if is_group:
@@ -161,6 +180,7 @@ def fold_card_for_main_prompt(
             long_structured=card.long_structured,
             inline_head="",
             speech_expand=False,
+            render_allowed=render_allowed,
         )
     return PersistedHandleCard(
         id=card.id,
@@ -172,6 +192,7 @@ def fold_card_for_main_prompt(
         long_structured=card.long_structured,
         inline_head=extract_inline_head(content, max_chars=_INLINE_HEAD_PRIVATE),
         speech_expand=True,
+        render_allowed=render_allowed,
     )
 
 
@@ -226,12 +247,14 @@ async def persist_subagent_result(
     content: str,
     task: AIAgentTask,
     res_handle: str,
+    *,
+    is_silent_check: bool = False,
 ) -> Optional[PersistedHandleCard]:
     body = content or ""
-    if len(body.strip()) < 40:
+    if len(body.strip()) < 40 and not is_silent_check:
         return None
     root = task.root_task_id or task.id
-    return await _write_record(
+    card = await _write_record(
         rid_prefix="sa",
         content=body,
         root_task_id=root,
@@ -246,6 +269,35 @@ async def persist_subagent_result(
         res_handle=res_handle or "",
         long_structured=True,
     )
+    if card is not None:
+        from gsuid_core.ai_core.journal.manager import JournalEntry, record_journal_entry
+        from gsuid_core.ai_core.agent_node.registry import get_node
+
+        is_private = (task.scope_key or "").startswith("user_global:") and not task.group_id
+        if not is_private:
+            node = get_node(profile)
+            tag = (node.display_name if node else profile) or "后台任务"
+            tag = re.sub(r"(代理|Agent|_agent)$", "", tag).strip()
+            clean_summary = extract_info_summary(body, max_len=120)
+            clean_summary = re.sub(r"^[#\s\-*]+", "", clean_summary).strip()
+            now_dt = datetime.now()
+            entry = JournalEntry(
+                timestamp=now_dt.timestamp(),
+                date_str=now_dt.strftime("%Y-%m-%d"),
+                time_str=now_dt.strftime("%H:%M"),
+                tag=tag[:20],
+                summary=clean_summary[:80],
+                handle_id=card.id,
+                group_id=str(task.group_id or "") if task.group_id else "",
+                is_silent_check=is_silent_check or ("<<NO_BROADCAST>>" in content),
+            )
+            asyncio.create_task(
+                record_journal_entry(
+                    entry,
+                    fanout_all_active=not bool(task.group_id),
+                )
+            )
+    return card
 
 
 async def _remember_short_tool_fact(tool_name: str, content: str, ev: Optional[Event], session_id: str) -> None:
@@ -281,13 +333,17 @@ async def persist_and_fold_tool_return(
     root_task_id: str = "",
     *,
     is_group: bool = False,
+    create_by: str = "",
 ) -> Optional[str]:
-    """过阈值落盘并返回句柄卡；群聊不内嵌要点。主人格与能力代理共用。"""
+    """过阈值落盘并返回句柄卡；能力代理大阈值且总带 inline_head。"""
     tn = tool_name or ""
+    if tn == "run_code":
+        return None
+    is_cap = create_by == "CapabilityAgent"
     if not should_persist_tool_return(tn, content):
         await _remember_short_tool_fact(tn, content, ev, session_id)
         return None
-    if not should_fold_for_model(content, tool_name=tn, is_group=is_group):
+    if not should_fold_for_model(content, tool_name=tn, is_group=is_group, is_capability=is_cap):
         if is_searchish_tool(tn):
             await persist_tool_return(
                 tool_name=tn,
@@ -318,7 +374,19 @@ async def persist_and_fold_tool_return(
     if card is None:
         return None
     fileos_metrics.inc_fold()
-    return fold_card_for_main_prompt(card, content=content, is_group=is_group).format()
+    effective_is_group = False if is_cap else is_group
+    # 能力代理本无 create_subagent，花名册口径只对主人格生效
+    render_allowed = True
+    if not is_cap:
+        from gsuid_core.ai_core.agent_node.registry import persona_allows_capability_agent
+
+        render_allowed = persona_allows_capability_agent(_persona_name_for_session(session_id), "render_agent")
+    return fold_card_for_main_prompt(
+        card,
+        content=content,
+        is_group=effective_is_group,
+        render_allowed=render_allowed,
+    ).format()
 
 
 async def _write_record(

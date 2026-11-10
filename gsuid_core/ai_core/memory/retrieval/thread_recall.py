@@ -1,4 +1,4 @@
-"""主题召回 → session 聚合。排序/摘要题的候选池，不走时间盲采样。"""
+"""故事线召回：按 Thread 里程碑取 Episode，按 session 分桶词面新颖取样补候选。"""
 
 from __future__ import annotations
 
@@ -53,7 +53,11 @@ def chrono_diverse_episodes(episodes: list[Episode], cap: int) -> list[Episode]:
     """按 session 轮询取词面不重复的 turn，避免第一段套话占满 N 栏。"""
     if cap <= 0 or not episodes:
         return []
-    from gsuid_core.ai_core.memory.retrieval.lexical import _assistant_turn, _skip_order_noise, _speaker_stripped
+    from gsuid_core.ai_core.memory.retrieval.lexical import (
+        _assistant_turn,
+        _skip_order_noise,
+        _speaker_stripped,
+    )
 
     clean: list[Episode] = []
     seen: set[str] = set()
@@ -121,7 +125,6 @@ def chrono_diverse_episodes(episodes: list[Episode], cap: int) -> list[Episode]:
                 best = ep
         return best
 
-    # 第一段留最早；之后每 session 取相对已选词面最新颖的一条。
     if not _take(groups[order[0]][0]):
         alt = _best_in(order[0])
         if alt is not None:
@@ -146,27 +149,6 @@ def chrono_diverse_episodes(episodes: list[Episode], cap: int) -> list[Episode]:
             break
     picked.sort(key=lambda e: str(e["valid_at"] if "valid_at" in e else ""))
     return picked[:cap]
-
-
-def pick_diverse_session_turns(
-    episodes: list[Episode],
-    *,
-    cap: int,
-    scores: dict[str, float] | None = None,
-) -> list[Episode]:
-    """opener + 高分且词面不重复的命中。无分数时退回 session 轮询。"""
-    if not episodes:
-        return []
-    if not scores:
-        return chrono_diverse_episodes(episodes, cap)
-    ordered = sorted(episodes, key=lambda e: str(e["valid_at"] if "valid_at" in e else ""))
-    opener = [ordered[0]]
-    rest = sorted(
-        ordered[1:],
-        key=lambda e: scores[e["id"]] if "id" in e and e["id"] in scores else 0.0,
-        reverse=True,
-    )
-    return pick_session_bundle(opener, rest, per_session_cap=cap)
 
 
 def expand_kept_sessions(
@@ -195,50 +177,21 @@ def expand_kept_sessions(
     return out
 
 
-def pick_session_bundle(openers: list[Episode], hits: list[Episode], *, per_session_cap: int = 4) -> list[Episode]:
-    """opener + 词面不重复的最高分命中。套话复述不得占满栏目。"""
-    seen: set[str] = set()
-    picked: list[Episode] = []
-    used: list[set[str]] = []
+def _episode_typed(row: object) -> Episode:
+    from gsuid_core.ai_core.memory.database.models import AIMemEpisode
 
-    def _seen_id(ep: Episode) -> bool:
-        eid = ep["id"] if "id" in ep else ""
-        if eid and eid in seen:
-            return True
-        if eid:
-            seen.add(eid)
-        return False
-
-    def _close_to_picked(tok: set[str]) -> bool:
-        return any(tokens_too_close(tok, prev) for prev in used)
-
-    for ep in openers:
-        if _seen_id(ep):
-            continue
-        picked.append(ep)
-        used.append(_content_tokens(ep))
-        if len(picked) >= per_session_cap:
-            break
-    if len(picked) < per_session_cap:
-        skipped: list[Episode] = []
-        for ep in hits:
-            if _seen_id(ep):
-                continue
-            tok = _content_tokens(ep)
-            if used and _close_to_picked(tok):
-                skipped.append(ep)
-                continue
-            picked.append(ep)
-            used.append(tok)
-            if len(picked) >= per_session_cap:
-                break
-        if len(picked) < per_session_cap:
-            for ep in skipped:
-                if len(picked) >= per_session_cap:
-                    break
-                picked.append(ep)
-    picked.sort(key=lambda e: e["valid_at"] if "valid_at" in e else "")
-    return picked
+    if not isinstance(row, AIMemEpisode):
+        raise TypeError("episode row")
+    return {
+        "id": row.id,
+        "content": row.content,
+        "valid_at": str(row.valid_at),
+        "scope_key": row.scope_key,
+        "embedding": [],
+        "session_id": row.session_id or "",
+        "thread_id": row.thread_id or "",
+        "turn_index": row.turn_index,
+    }
 
 
 async def recall_thread_candidates(
@@ -250,12 +203,12 @@ async def recall_thread_candidates(
     thread_bonus: dict[str, float] | None = None,
 ) -> list[Episode]:
     """hybrid 只排 session；证据用 SQL 展开该 session 的用户原文再新颖取样。"""
+    from gsuid_core.ai_core.memory.vector.ops import search_episodes
+    from gsuid_core.ai_core.memory.database.models import AIMemEpisode
+
     topic = _topic_query(query)
     if not topic or not scope_keys:
         return []
-    from gsuid_core.ai_core.memory.vector.ops import search_episodes
-    from gsuid_core.ai_core.memory.database.models import AIMemEpisode, AIMemSession
-
     hits = await search_episodes(topic, scope_keys, top_k=top_k, score_threshold=0.0)
     hit_ids = [str(h["id"]) for h in hits if "id" in h]
     sid_map = await AIMemEpisode.session_map_by_ids(hit_ids)
@@ -271,9 +224,7 @@ async def recall_thread_candidates(
         if not sid:
             orphans.append(ep)
             continue
-        if sid not in buckets:
-            buckets[sid] = []
-        buckets[sid].append((score, ep))
+        buckets.setdefault(sid, []).append((score, ep))
 
     def _sid_score(sid: str) -> float:
         base = session_aggregate_score([s for s, _ep in buckets[sid]])
@@ -287,39 +238,31 @@ async def recall_thread_candidates(
     keep = ranked_sids[:top_m]
     scope_sids: list[str] = []
     for sk in scope_keys:
-        for row in await AIMemSession.list_by_scope(sk, limit=top_m):
-            if row.id and row.id not in scope_sids:
-                scope_sids.append(row.id)
-    # 会话少时必须全收：hybrid top_k 会被第一段套话占满，后面的 session 根本进不了 keep。
+        for sid, _dt, _eid in await AIMemEpisode.list_threadless_sessions(sk, limit=top_m):
+            if sid and sid not in scope_sids:
+                scope_sids.append(sid)
     if scope_sids and len(scope_sids) <= top_m:
-        keep = scope_sids
-    else:
         for sid in scope_sids:
             if sid not in keep:
                 keep.append(sid)
-            if len(keep) >= top_m:
-                break
     per_sess = max(8, cap_n * 2)
-    from gsuid_core.ai_core.memory.retrieval.lexical import _assistant_turn, _episode_from_orm
+    from gsuid_core.ai_core.memory.retrieval.lexical import _assistant_turn
 
     rows = await AIMemEpisode.list_by_sessions(keep, limit=8000)
     by_sid: dict[str, list[Episode]] = {}
     for row in rows:
-        ep = _episode_from_orm(row)
+        ep = _episode_typed(row)
         if _assistant_turn(ep["content"] or ""):
             continue
         sid = ep["session_id"] if "session_id" in ep else ""
         if not sid:
             continue
-        if sid not in by_sid:
-            by_sid[sid] = []
-        by_sid[sid].append(ep)
+        by_sid.setdefault(sid, []).append(ep)
     for sid, scored in buckets.items():
         if sid not in keep:
             continue
-        if sid not in by_sid:
-            by_sid[sid] = []
-        have = {e["id"] for e in by_sid[sid] if "id" in e}
+        slot = by_sid.setdefault(sid, [])
+        have = {e["id"] for e in slot if "id" in e}
         for _sc, ep in scored:
             eid = ep["id"] if "id" in ep else ""
             if eid and eid in have:
@@ -328,7 +271,7 @@ async def recall_thread_candidates(
                 continue
             if eid:
                 have.add(eid)
-            by_sid[sid].append(ep)
+            slot.append(ep)
     out = expand_kept_sessions(keep, by_sid, cap_per=per_sess)
     seen = {e["id"] for e in out if "id" in e}
     target = max(top_m, cap_n * 4)
@@ -342,6 +285,7 @@ async def recall_thread_candidates(
                 out.append(ep)
             if len(out) >= target:
                 break
+    out.sort(key=lambda e: e["valid_at"])
     return out
 
 
@@ -351,86 +295,69 @@ async def recall_span_threads(
     user_id: str,
     group_id: str | None,
 ) -> tuple[list[Episode], list[MemoryEventCue]]:
-    """只读已有 thread。session / thread 回填留在睡眠 tick。"""
-    if not query or not scope_keys or not user_id:
-        return [], []
-    sample, cues = await recall_from_threads(query, scope_keys)
-    if not sample:
-        sample = await recall_thread_candidates(query, scope_keys)
-    if not sample:
-        from gsuid_core.ai_core.memory.retrieval.lexical import user_episodes_chrono_sample
-
-        sample = await user_episodes_chrono_sample(user_id=user_id, group_id=group_id)
-    return sample, cues
-
-
-async def recall_from_threads(
-    query: str,
-    scope_keys: list[str],
-) -> tuple[list[Episode], list[MemoryEventCue]]:
-    """Phase 5：命中 thread 后按 stated_at 取事件线索，再 RPE 展开源 session。"""
-    from gsuid_core.ai_core.memory.database.models import AIMemEvent, AIMemThread, AIMemEpisode, AIMemSession
-    from gsuid_core.ai_core.memory.retrieval.lexical import query_tokens
-
+    """只读已有 thread：按里程碑回源 Episode，并补齐 session 新颖取样候选。"""
     if not query or not scope_keys:
         return [], []
+    from gsuid_core.ai_core.memory.database.models import AIMemEdge, AIMemThread, AIMemEpisode
+
     threads: list[AIMemThread] = []
     for sk in scope_keys:
         threads.extend(await AIMemThread.list_by_scope(sk, limit=80))
-    if not threads:
-        return [], []
-    qtoks = {t.lower() for t in query_tokens(query) if len(t) >= 4}
-    scores: dict[str, list[float]] = {}
-    for th in threads:
-        blob = f"{th.title} {' '.join(th.aliases)}".lower()
-        hit = 0.0
-        for tok in qtoks:
-            if tok in blob:
-                hit += 1.0
-        if hit > 0:
-            scores[th.id] = [hit]
-    from gsuid_core.ai_core.memory.vector.ops import search_episodes
-
-    hits = await search_episodes(_topic_query(query) or query, scope_keys, top_k=200, score_threshold=0.0)
-    hit_ids = [str(h["id"]) for h in hits if "id" in h]
-    sid_map = await AIMemEpisode.session_map_by_ids(hit_ids)
-    sess_ids: list[str] = []
-    for eid, sid in sid_map.items():
-        if sid and sid not in sess_ids:
-            sess_ids.append(sid)
-    sess_rows = await AIMemSession.get_by_ids(sess_ids)
-    sid_to_tid = {s.id: s.thread_id for s in sess_rows if s.thread_id}
-    for i, ep in enumerate(hits):
-        eid = str(ep["id"]) if "id" in ep else ""
-        sid = ep["session_id"] if "session_id" in ep else ""
-        if not sid and eid in sid_map:
-            sid = sid_map[eid]
-        tid = sid_to_tid[sid] if sid in sid_to_tid else ""
-        if not tid:
-            continue
-        if tid not in scores:
-            scores[tid] = []
-        scores[tid].append(1.0 / (60.0 + i))
-    ranked = sorted(scores, key=lambda tid: session_aggregate_score(scores[tid]), reverse=True)
-    if not ranked:
-        return [], []
-    llm_tids = [th.id for th in threads if th.title_source == "llm" and th.id in set(ranked)]
-    events = await AIMemEvent.list_by_threads(llm_tids, limit=64) if llm_tids else []
+    episodes: list[Episode] = []
     cues: list[MemoryEventCue] = []
-    for ev in events:
-        stated = ev.stated_at or ev.start_at
-        ev_at = ev.event_at
-        cues.append(
-            {
-                "summary": ev.summary,
-                "stated_at": stated.strftime("%Y-%m-%d %H:%M:%S") if stated is not None else "",
-                "event_at": ev_at.strftime("%Y-%m-%d %H:%M:%S") if ev_at is not None else "",
-                "turn_episode_id": ev.turn_episode_id or ev.episode_id,
-                "thread_id": ev.thread_id or "",
-                "source": "llm",
-            }
-        )
-    sids = await AIMemSession.ids_for_threads(ranked)
-    bonus = {sid: 1.5 for sid in sids}
-    sample = await recall_thread_candidates(query, scope_keys, thread_bonus=bonus)
-    return sample, cues
+    if threads:
+        terms = {tok.lower() for tok in _topic_query(query).split() if tok.strip()}
+        matched = [
+            th
+            for th in threads
+            if not terms or any(term in f"{th.title} {' '.join(th.aliases)}".lower() for term in terms)
+        ]
+        if not matched:
+            matched = threads[:4]
+        for th in matched[:6]:
+            milestones = await AIMemEdge.list_thread_milestones(th.scope_key, th.id, limit=120, ascending=True)
+            for edge in milestones:
+                stamp = edge.event_at or edge.valid_at
+                cues.append(
+                    {
+                        "summary": edge.fact,
+                        "stated_at": edge.valid_at.strftime("%Y-%m-%d %H:%M:%S") if edge.valid_at else "",
+                        "event_at": edge.event_at.strftime("%Y-%m-%d %H:%M:%S") if edge.event_at else "",
+                        "turn_episode_id": edge.source_episode_id or "",
+                        "thread_id": th.id,
+                        "source": "milestone",
+                    }
+                )
+                if not edge.source_episode_id:
+                    continue
+                row = await AIMemEpisode.get_one(edge.source_episode_id)
+                if row is not None:
+                    episodes.append(
+                        {
+                            "id": row.id,
+                            "content": row.content,
+                            "valid_at": str(stamp or row.valid_at),
+                            "scope_key": row.scope_key,
+                            "embedding": [],
+                            "session_id": row.session_id or "",
+                            "thread_id": row.thread_id or "",
+                            "turn_index": row.turn_index,
+                        }
+                    )
+    sample = await recall_thread_candidates(query, scope_keys)
+    if sample:
+        seen = {e["id"] for e in episodes if "id" in e}
+        for ep in sample:
+            eid = ep["id"] if "id" in ep else ""
+            if eid and eid in seen:
+                continue
+            if eid:
+                seen.add(eid)
+            episodes.append(ep)
+    if not episodes and user_id:
+        from gsuid_core.ai_core.memory.retrieval.lexical import user_episodes_chrono_sample
+
+        episodes = await user_episodes_chrono_sample(user_id=user_id, group_id=group_id)
+    if episodes:
+        episodes.sort(key=lambda e: e["valid_at"])
+    return episodes, cues

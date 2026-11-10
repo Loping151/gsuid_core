@@ -88,7 +88,7 @@ AI_CONFIG: Dict[str, GSC] = {
         "指定网络搜索的主用提供方。未配置或主用无 Key 时走 AnySearch 匿名额度。"
         "多源策略非「无」时，失败会按备用顺序切换到其它已配置源",
         "AnySearch",
-        options=["AnySearch", "Firecrawl", "Tavily", "Jina", "Exa", "MCP"],
+        options=["AnySearch", "Firecrawl", "DeepSeek", "Tavily", "Jina", "Exa", "MCP"],
     ),
     "websearch_lb_strategy": GsStrConfig(
         "网络搜索多源策略",
@@ -99,16 +99,17 @@ AI_CONFIG: Dict[str, GSC] = {
     "websearch_fallback_order": GsListStrConfig(
         "网络搜索备用源顺序",
         "错误切换/自动分流时的候选顺序（不含主用源）。留空则自动收集已配置源"
-        "（顺序：AnySearch → Firecrawl → Tavily → Exa → Jina → MCP）",
+        "（顺序：AnySearch → Firecrawl → DeepSeek → Tavily → Exa → Jina → MCP）",
         [],
-        options=["AnySearch", "Firecrawl", "Tavily", "Jina", "Exa", "MCP"],
+        options=["AnySearch", "Firecrawl", "DeepSeek", "Tavily", "Jina", "Exa", "MCP"],
     ),
     "webfetch_provider": GsStrConfig(
         "网页抓取服务提供方（主用）",
-        "Jina：经 r.jina.ai 读取（API Key 可选）；local：本机直连抓取并转 Markdown。"
-        "多源策略非「无」时，失败会按备用顺序切换",
+        "Jina：经 r.jina.ai 读取（API Key 可选）；DeepSeek：经 DeepSeek Fetch API 抓取；"
+        "Exa：经 Exa Contents 读取这个 URL 的正文（用 exa_config 的 Key）；"
+        "local：本机直连抓取并转 Markdown。多源策略非「无」时，失败会按备用顺序切换",
         "Jina",
-        options=["Jina", "local"],
+        options=["Jina", "DeepSeek", "Exa", "local"],
     ),
     "webfetch_lb_strategy": GsStrConfig(
         "网页抓取多源策略",
@@ -120,7 +121,21 @@ AI_CONFIG: Dict[str, GSC] = {
         "网页抓取备用源顺序",
         "错误切换/自动分流时的候选顺序（不含主用）。默认 local",
         ["local"],
-        options=["Jina", "local"],
+        options=["Jina", "DeepSeek", "Exa", "local"],
+    ),
+    "render_image_sources": GsListStrConfig(
+        "出图配图来源",
+        "render_agent 出图前调 find_images 找配图，按此顺序尝试，前一个来源凑够张数就停。"
+        "插件图库：插件用 ai_image 登记的图片（需开启知识库）。"
+        "免费源在前：Firecrawl 没填 Key 时走免费档，360 是公开接口、不需要 Key。"
+        "Tavily 需要 Key，排在免费源后面。留空则不找配图",
+        ["插件图库", "Firecrawl", "360", "Tavily"],
+        options=["插件图库", "Firecrawl", "360", "Tavily"],
+    ),
+    "render_embed_images": GsBoolConfig(
+        "允许嵌入配图",
+        "开启后，出图前会按「出图配图来源」搜图并嵌进长图。关闭后不再搜图，页头和对象改用图标。",
+        True,
     ),
     "image_understand_provider": GsStrConfig(
         "图片理解服务提供方",
@@ -179,6 +194,20 @@ AI_CONFIG: Dict[str, GSC] = {
         300,
         options=[120, 300, 600, 900],
     ),
+    "follow_up_max_replies": GsIntConfig(
+        "免唤醒续聊回复次数上限",
+        "一个续聊窗口内允许软触发成功回复的最大次数。达到上限后不再软触发，"
+        "直到该用户再次 @、关键词或私聊。设为 0 表示不限制。默认 2 次。",
+        2,
+        options=[1, 2, 3, 5],
+    ),
+    "follow_up_debounce_seconds": GsFloatConfig(
+        "免唤醒续聊防抖合并缓冲(秒)",
+        "群聊中同一用户在续聊窗口内连发短消息时，等待合并的缓冲时间（秒）。硬触发不进缓冲。设为0关闭合并。",
+        3.0,
+        min_value=0.0,
+        max_value=10.0,
+    ),
     "spMode": GsDivider(
         "Agent 特殊模式",
         "Agent 特殊模式",
@@ -195,8 +224,8 @@ AI_CONFIG: Dict[str, GSC] = {
         "Agent 运行调参",
     ),
     "multi_agent_lenth": GsIntConfig(
-        "最多允许AI思考轮数",
-        "指定多轮思考调用工具的最大递归深度, 注意: 多轮对话会占用更多的token, 请根据实际情况调整",
+        "主Agent最多思考轮数",
+        "主对话每一轮允许的最大思考次数。子 Agent 与能力代理不读这项。多轮会占用更多 token。",
         20,
         options=[9, 12, 20, 30],
     ),
@@ -231,13 +260,6 @@ AI_CONFIG: Dict[str, GSC] = {
         "群聊瘦核下的工具名上限; 超顶拒新名、不 evict。闲聊保持瘦核, 有持久实体时才 append。修改后即时生效",
         20,
         options=[12, 16, 20, 24, 32],
-    ),
-    "group_idle_max_iterations": GsIntConfig(
-        "群聊旁观轮最大思考轮数",
-        "群聊无人寻址且无跟进、无在途任务时的 request_limit 上限, 防止零工具空转。"
-        "点名与省略续聊轮不收窄。修改后即时生效",
-        2,
-        options=[2, 3, 4, 6, 9],
     ),
     "main_channel_visible_limit": GsIntConfig(
         "主通道单轮出站上限",
@@ -298,6 +320,17 @@ AI_CONFIG: Dict[str, GSC] = {
         45,
         options=[45, 60, 80, 120, 200],
     ),
+    "mcp_profile_llm_enable": GsBoolConfig(
+        "MCP 中文介绍 LLM 补全",
+        "注册 MCP 服务后若缺中文描述, 后台调用高级模型生成中文能力说明供路由使用; 关闭则只用拼接文案",
+        True,
+    ),
+    "mcp_profile_llm_timeout_sec": GsIntConfig(
+        "MCP 介绍生成超时(秒)",
+        "MCP 中文介绍单次 LLM 调用超时时间, 超时只影响生成质量, 不影响工具注册",
+        60,
+        options=[30, 60, 90, 120],
+    ),
     "agent_max_run_attempts": GsIntConfig(
         "核心请求重试次数",
         "网络抖动/超时/5xx 等瞬时失败时核心回复请求的最大尝试次数(含首次)。内容审核等永久错误不重试",
@@ -319,10 +352,10 @@ AI_CONFIG: Dict[str, GSC] = {
     ),
     # 任务档预算（AgentNode 统一后节点不再携带预算, 所有能力代理统一走这两项）
     "task_max_iterations": GsIntConfig(
-        "任务代理最大思考轮数",
-        "能力代理(task-mode 节点)单次任务的最大工具调用轮数; 插件开发等重型任务不够用时全局调大",
-        30,
-        options=[12, 20, 30, 40, 60],
+        "子Agent最大思考轮数",
+        "能力代理与子 Agent 单次任务的最大思考轮数，与主对话分开。重型任务不够用时调大。",
+        56,
+        options=[20, 30, 40, 56, 80],
     ),
     "task_max_tokens": GsIntConfig(
         "任务代理单次输出Token上限",
@@ -399,12 +432,6 @@ AI_CONFIG: Dict[str, GSC] = {
         3,
         options=[1, 2, 3, 5],
     ),
-    "favor_daily_loss_cap": GsIntConfig(
-        "每日扣分上限(绝对值)",
-        "同一用户单日最多扣多少好感, 防止单日螺旋下坠",
-        8,
-        options=[4, 8, 12, 20],
-    ),
     "favor_session_gain_cap": GsIntConfig(
         "会话窗增益上限",
         "同一用户在'会话窗分钟数'内普通正信号最多涨多少",
@@ -441,8 +468,9 @@ AI_CONFIG: Dict[str, GSC] = {
     "render_long_markdown_as_image": GsBoolConfig(
         "长markdown整篇出图(呈现层兜底)",
         "仅作**兜底**：主路径应委派 render_agent 出设计图。"
-        "开启后, 仍漏网的结构化长 markdown 会整篇渲成资料图防刷屏；"
-        "默认关闭，避免主人格浅分析被渲成丑图双发。判定刻意保守。",
+        "开启后, 仍漏网的结构化长 markdown 先交给 render_agent 出图；"
+        "未启用出图或没交出图片时，才用 render_md_to_bytes。"
+        "默认关闭，避免主人格浅分析被渲成丑图。判定刻意保守。",
         False,
     ),
     "markdown_image_min_chars": GsIntConfig(
@@ -500,14 +528,8 @@ AI_CONFIG: Dict[str, GSC] = {
     ),
     "InteractionScaffold": GsDivider(
         "交互脚手架调参",
-        "C-1~C-4 交互脚手架的触发阈值(默认值按评测分布标定, 上线后按[Scaffold]日志的生产分布重标)",
+        "C-1~C-3 交互脚手架的触发阈值(默认值按评测分布标定, 上线后按[Scaffold]日志的生产分布重标)",
         "交互脚手架调参",
-    ),
-    "scaffold_wall_clock_budget": GsIntConfig(
-        "墙钟软预算(秒)",
-        "交互式run超过该墙钟秒数后注入一次'停止新工具轮,收敛作答'提示(C-4), 治多步任务延迟长尾",
-        45,
-        options=[30, 45, 60, 90, 120],
     ),
     "scaffold_followup_max_len": GsIntConfig(
         "省略式跟进最长字数",
@@ -662,12 +684,6 @@ EXA_CONFIG: Dict[str, GSC] = {
         10,
         options=[5, 10, 15, 20],
     ),
-    "search_type": GsStrConfig(
-        "搜索类型",
-        "指定搜索类型，neural 为语义搜索（更智能），keyword 为关键词搜索（更精确）",
-        "neural",
-        options=["neural", "keyword"],
-    ),
 }
 
 ANYSEARCH_CONFIG: Dict[str, GSC] = {
@@ -746,6 +762,45 @@ MINIMAX_CONFIG: Dict[str, GSC] = {
         "指定资源提供方式，url 为返回 URL 链接，local 为返回本地文件路径",
         "url",
         options=["url", "local"],
+    ),
+}
+
+# DeepSeek：搜索与抓取共用 API Key 与超时设置
+DEEPSEEK_CONFIG: Dict[str, GSC] = {
+    "api_key": GsListStrConfig(
+        "DeepSeek API密钥",
+        "前往 https://platform.deepseek.com 获取。支持配置多个 Key 自动轮询与故障重试",
+        [],
+        options=[],
+    ),
+    "max_results": GsIntConfig(
+        "最大搜索结果数",
+        "DeepSeek 每次搜索的最大返回结果数量(1-50)",
+        10,
+        options=[5, 10, 15, 20, 30, 50],
+    ),
+    "timeout": GsIntConfig(
+        "请求超时(秒)",
+        "调用 DeepSeek 搜索/抓取 API 的超时时间",
+        30,
+        options=[10, 15, 20, 30, 45, 60],
+    ),
+    "search_base_url": GsStrConfig(
+        "搜索 API 地址",
+        "DeepSeek 网页搜索接口地址，默认 https://api.deepseek.com/v1/tools/search",
+        "https://api.deepseek.com/v1/tools/search",
+        options=["https://api.deepseek.com/v1/tools/search"],
+    ),
+    "fetch_base_url": GsStrConfig(
+        "抓取 API 地址",
+        "DeepSeek 网页抓取接口地址，默认 https://api.deepseek.com/v1/tools/fetch",
+        "https://api.deepseek.com/v1/tools/fetch",
+        options=["https://api.deepseek.com/v1/tools/fetch"],
+    ),
+    "need_content": GsBoolConfig(
+        "是否获取全文内容",
+        "DeepSeek 搜索是否在结果中返回网页全文 content（默认否，使用 summary 摘要）",
+        False,
     ),
 }
 
@@ -837,8 +892,8 @@ WEB_FETCH_CONFIG: Dict[str, GSC] = {
 LOCAL_EMBEDDING_CONFIG: Dict[str, GSC] = {
     "embedding_model_name": GsStrConfig(
         "指定嵌入模型名称",
-        "本地 fastembed 模型。jina-v2-base-zh 中英混合且 8192 token；bge-small-zh 仅中文且 512 token 会截断长片段",
-        "BAAI/bge-small-zh-v1.5",
+        "本地 fastembed 模型。bge-small-en-v1.5 为 384 维英文模型，中文工具召回由 CJK-BM25 补齐",
+        "BAAI/bge-small-en-v1.5",
         options=[
             "jinaai/jina-embeddings-v2-base-zh",
             "BAAI/bge-small-zh-v1.5",
@@ -1029,91 +1084,6 @@ MEMORY_CONFIG: Dict[str, GSC] = {
         1800,
         options=[600, 1800, 3600, 7200],
     ),
-    "enable_system2get": GsBoolConfig(
-        "是否启用 System-2",
-        "指定是否启用 System-2, 可以提高检索精度但会增加性能开销",
-        False,
-    ),
-    "MemoryRetrieval": GsDivider(
-        "记忆摄取设置",
-        "记忆摄取设置",
-        "记忆摄取设置",
-    ),
-    "background_episode_count": GsIntConfig(
-        "抽取背景片段数量",
-        "实体抽取时注入的近期对话片段(Episode)数量, 用于跨批次指代消解; "
-        "调小可显著降低每次抽取的 Token 开销(原始信息仍由 Episode 完整留存), 0 表示不注入背景",
-        1,
-        options=[0, 1, 2, 3],
-    ),
-    "background_episode_max_chars": GsIntConfig(
-        "抽取背景片段字符上限",
-        "每条注入的近期对话片段(Episode)在抽取提示词中的最大字符数, 超出部分截断; 调小可降低 Token 开销",
-        600,
-        options=[300, 600, 1000, 2000],
-    ),
-    "extraction_value_gate": GsStrConfig(
-        "抽取价值门控档位",
-        "决定哪些消息会触发 LLM 实体抽取(无论档位, 原文都完整存为 Episode, 不丢信息)。"
-        "宽松: 默认全部抽取(最全, 最费 Token); "
-        "均衡: 无实体特征的纯寒暄降级为仅存档不抽取; "
-        "严格: 仅含强信号(姓名/承诺/情绪等)的消息才抽取(最省 Token)",
-        "均衡",
-        options=["宽松", "均衡", "严格"],
-    ),
-    "hiergraph_build_mode": GsStrConfig(
-        "分层图构建模式",
-        "分层类目树仅被 System-2 检索消费, 也是记忆重建 Token 的大头(实体/边/原文不受影响)。"
-        "自动: 仅当启用 System-2 时才构建整棵类目树, 否则只按需刷新群摘要(推荐, 最省); "
-        "始终: 总是构建完整类目树(旧行为); "
-        "仅摘要: 从不建树, 仅按需刷新群摘要; "
-        "关闭: 既不建树也不生成摘要(最省 Token)",
-        "自动",
-        options=["自动", "始终", "仅摘要", "关闭"],
-    ),
-    "hiergraph_batch_size": GsIntConfig(
-        "分层图单批节点数",
-        "建树时每次 LLM 分类的节点数。调大→单轮 LLM 调用更少、每批重发的固定开销(system+现有类目)"
-        "被摊薄更省 Token; 但过大会拉长单次耗时、逼近超时(超时兜底会让每节点单独成类, 污染类目)。"
-        "模型较慢时建议保持较小值",
-        20,
-        options=[15, 20, 30, 40],
-    ),
-    "hiergraph_vector_assign_threshold": GsStrConfig(
-        "分层图向量预分配阈值",
-        "建树时新实体与已归类近邻的余弦相似度 ≥ 此阈值即直接归类、跳过 LLM。"
-        "调低→更多实体走零 LLM 的预分配路径、更省 Token, 但误归类风险上升(宁可漏分不可错分)",
-        "0.85",
-        options=["0.80", "0.82", "0.85", "0.88", "0.90"],
-    ),
-    "hiergraph_min_entities": GsIntConfig(
-        "分层图最小实体门槛",
-        "scope 实体数低于此值则整体跳过分层图(含轻量群摘要)。调大→更多小群被整体跳过、更省 Token; "
-        "其召回仍由 System-1 向量 + edges 覆盖, 不影响记忆完整性",
-        30,
-        options=[30, 50, 80, 120, 200],
-    ),
-    "hiergraph_max_existing_cats": GsIntConfig(
-        "分层图已有类目上限",
-        "建树分类时每批最多带入的已有类目数(仅名称)。调小→每批 prompt 更省 Token, "
-        "但过小会让 LLM 看不到已有类目而重复造新类目, 反而膨胀后续成本",
-        50,
-        options=[20, 30, 50, 80],
-    ),
-    "hiergraph_node_summary_chars": GsIntConfig(
-        "分层图节点摘要字符上限",
-        "建树分类时每个待分类节点附带的实体摘要字符数(名称+标签始终保留)。"
-        "调小(含 0=不带摘要)更省 Token, 但摘要有助于消歧相近实体, 过小可能降低归类精度",
-        60,
-        options=[0, 30, 60, 100],
-    ),
-    "hiergraph_summary_delta": GsIntConfig(
-        "群摘要刷新增量阈值",
-        "自上次重建以来新增实体达此值才重新生成群摘要(Heartbeat/人格群语境消费)。"
-        "调大→摘要刷新更稀疏、更省 Token, 代价是摘要新鲜度下降",
-        50,
-        options=[50, 100, 200, 500],
-    ),
     "MemoryProcedural": GsDivider(
         "程序性 / 偏好记忆设置",
         "程序性 / 偏好记忆设置",
@@ -1134,7 +1104,7 @@ MEMORY_CONFIG: Dict[str, GSC] = {
     ),
     "fact_max_inject": GsIntConfig(
         "核心事实单次注入条数上限",
-        "单次回复最多注入的核心事实条数; 字符预算对短垃圾行不设防, 条数与字符双限取严(§25(4))",
+        "单次回复最多注入的核心事实条数; 与字符预算双限取严, 防止大量短句占满上下文",
         12,
         options=[6, 12, 20, 30],
     ),
@@ -1157,61 +1127,6 @@ MEMORY_CONFIG: Dict[str, GSC] = {
         "而非等聚合大窗。关闭则纠错偏好随常规摄入窗口落库",
         True,
     ),
-    "MemoryRFMem": GsDivider(
-        "RF-Mem 双过程检索设置(进阶)",
-        "RF-Mem 双过程检索设置(进阶)",
-        "RF-Mem 双过程检索设置(进阶)",
-    ),
-    "enable_familiarity_routing": GsBoolConfig(
-        "启用熟悉度路由",
-        "开启后用一次零 LLM 的向量探针(均分 s̄ + 列表熵)逐查询决定'检索多深', 把 System-2 从全局"
-        "开关降为'按不确定性触发': 熟悉的查询抑制 System-2 省 Token, 不确定的查询才放行深检索。"
-        "默认关; 阈值需按嵌入模型标定后再放量(见 MEMORY_SYSTEM 文档)",
-        False,
-    ),
-    "enable_recollection_path": GsBoolConfig(
-        "启用回忆环(仅 remote Qdrant)",
-        "回忆环是零 LLM 的 KMeans+α-mix 多轮向量深检索, 作为 System-2 关闭时的增召回替代。"
-        "仅在'启用熟悉度路由'开启、路由判低熟悉、System-2 未触发、且 qdrant_provider=remote 时生效"
-        "(本地嵌入式 Qdrant 是 O(N) 暴力扫, 多轮回忆会成倍放大检索成本, 故强制 remote)",
-        False,
-    ),
-    "familiarity_theta_high": GsFloatConfig(
-        "熟悉度上阈 θ_high",
-        "均分 s̄ ≥ 此值直接走浅检索(抑制 System-2)。余弦语义, 须按嵌入模型/语料离线标定"
-        "(论文英文模型经验值 0.6, 中文本地模型通常需平移; 建议取样本 s̄ 的 P75)",
-        0.6,
-        min_value=0.0,
-        max_value=1.0,
-    ),
-    "familiarity_theta_low": GsFloatConfig(
-        "熟悉度下阈 θ_low",
-        "均分 s̄ ≤ 此值直接走深检索。须按嵌入模型标定(论文经验值 0.3; 建议取样本 s̄ 的 P25)",
-        0.3,
-        min_value=0.0,
-        max_value=1.0,
-    ),
-    "familiarity_tau": GsFloatConfig(
-        "列表熵阈 τ",
-        "s̄ 落在上下阈之间时由列表熵 H 裁决: H > τ(候选分布越散越不确定)走深检索。"
-        "论文经验区间 0.2~0.25, > 0.35 会失去自适应",
-        0.22,
-        min_value=0.0,
-        max_value=1.0,
-    ),
-    "familiarity_lambda": GsFloatConfig(
-        "温度 softmax 锐度 λ",
-        "计算列表熵时对探针分数做温度 softmax 的锐度。论文 20~30, 不敏感, 一般无需调整",
-        20.0,
-        min_value=1.0,
-        max_value=100.0,
-    ),
-    "familiarity_probe_k": GsIntConfig(
-        "探针候选数 k",
-        "熟悉度探针拉取的候选 Episode 数(算 s̄/熵 用)。论文 10~20 即稳",
-        15,
-        options=[10, 15, 20, 30],
-    ),
     "MemoryExtra": GsDivider(
         "记忆其他设置",
         "记忆其他设置",
@@ -1219,7 +1134,7 @@ MEMORY_CONFIG: Dict[str, GSC] = {
     ),
     "eval_mode": GsBoolConfig(
         "记忆评测模式",
-        "指定是否启用记忆评测模式, 启用后无法使用 System-2 和 Rerank",
+        "指定是否启用记忆评测模式, 启用后跳过预测误差降级并在评测结束时统一执行故事线归并",
         False,
     ),
 }
@@ -1235,6 +1150,13 @@ ai_config = StringConfig(
     get_res_path("ai_core") / "ai_config.json",
     AI_CONFIG,
 )
+
+
+def render_embed_images_enabled() -> bool:
+    """出图是否允许搜图并嵌进长图。缺这个配置项时当作开启。"""
+    raw = ai_config.get_config("render_embed_images", True).data
+    return raw is True
+
 
 local_embedding_config = StringConfig(
     "GsCore AI 嵌入模型配置",
@@ -1276,6 +1198,12 @@ jina_config = StringConfig(
     "GsCore AI Jina搜索抓取配置",
     get_res_path("ai_core") / "jina_config.json",
     JINA_CONFIG,
+)
+
+deepseek_config = StringConfig(
+    "GsCore AI DeepSeek搜索抓取配置",
+    get_res_path("ai_core") / "deepseek_config.json",
+    DEEPSEEK_CONFIG,
 )
 
 web_fetch_config = StringConfig(

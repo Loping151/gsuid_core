@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 
 from gsuid_core.i18n import t as i18n_t
 from gsuid_core.logger import logger
-from gsuid_core.ai_core.memory.scope import ScopeType, make_scope_key
+from gsuid_core.ai_core.memory.scope import ScopeType, make_scope_key, self_scope_key, self_scope_read_keys
 from gsuid_core.ai_core.memory.relative_schedule import (
     preference_written_on,
     one_off_schedule_expired,
@@ -47,8 +47,8 @@ _ONTOLOGY_FIELD = "self_ontology"
 # 笔记里点名的用户。短数字（日期、版本）不算。
 _PINNED_SPEAKER_RE = re.compile(r"\d{5,}|[0-9A-Fa-f]{16,}")
 _USER_MENTION_RE = re.compile(r"(?:用户ID[:：\s]*|用户[:：\s]*)([a-zA-Z0-9_\-]+)")
-# 主人自述槽，不跟纠错规则抢本轮名额。
-_STANDING_PREF_CONTEXTS = frozenset({"location", "possession"})
+# 主人常驻自述槽（如常住地）。
+_STANDING_PREF_CONTEXTS = frozenset({"location"})
 
 
 def default_self_ontology() -> str:
@@ -62,11 +62,11 @@ def default_self_ontology() -> str:
     )
 
 
-async def ensure_self_ontology(bot_id: str) -> str:
+async def ensure_self_ontology(bot_id: str, persona_name: str) -> str:
     """框架写入本体知识；空则填默认模板。"""
     from gsuid_core.ai_core.state_store import state_mutate, state_get_value
 
-    raw = await state_get_value(_self_scope(bot_id), _SELF_MODEL_KEY)
+    raw = await state_get_value(_self_scope(bot_id, persona_name), _SELF_MODEL_KEY)
     if isinstance(raw, dict) and _ONTOLOGY_FIELD in raw:
         val = raw[_ONTOLOGY_FIELD]
         text_val = ""
@@ -84,7 +84,7 @@ async def ensure_self_ontology(bot_id: str) -> str:
                     model[_ONTOLOGY_FIELD] = text_val
                     return model
 
-                await state_mutate(_self_scope(bot_id), _SELF_MODEL_KEY, _mutate_refresh)
+                await state_mutate(_self_scope(bot_id, persona_name), _SELF_MODEL_KEY, _mutate_refresh)
             return text_val
     text = default_self_ontology()
 
@@ -93,13 +93,13 @@ async def ensure_self_ontology(bot_id: str) -> str:
         model[_ONTOLOGY_FIELD] = text
         return model
 
-    await state_mutate(_self_scope(bot_id), _SELF_MODEL_KEY, _mutate)
+    await state_mutate(_self_scope(bot_id, persona_name), _SELF_MODEL_KEY, _mutate)
     return text
 
 
-def _self_scope(bot_id: str) -> str:
-    """构造 Bot 自身的 state_store scope（与记忆 SELF scope 同形）。"""
-    return make_scope_key(ScopeType.SELF, bot_id or "default")
+def _self_scope(bot_id: str, persona_name: str) -> str:
+    """构造 Bot 自身的 state_store scope（与记忆 SELF scope 同形，按人格隔离）。"""
+    return self_scope_key(bot_id or "default", persona_name)
 
 
 def _normalize_self_model(raw: Any) -> Dict[str, List[str]]:
@@ -127,16 +127,17 @@ def _self_model_state(current: Any) -> Dict[str, object]:
     return model
 
 
-async def get_self_model(bot_id: str) -> Dict[str, List[str]]:
+async def get_self_model(bot_id: str, persona_name: str) -> Dict[str, List[str]]:
     """读取 Bot 的演化层自我模型，不存在时返回空结构。"""
     from gsuid_core.ai_core.state_store import state_get_value
 
-    raw = await state_get_value(_self_scope(bot_id), _SELF_MODEL_KEY)
+    raw = await state_get_value(_self_scope(bot_id, persona_name), _SELF_MODEL_KEY)
     return _normalize_self_model(raw)
 
 
 async def add_self_note(
     bot_id: str,
+    persona_name: str,
     content: str,
     field: str = "self_notes",
 ) -> bool:
@@ -183,12 +184,12 @@ async def add_self_note(
         model[field] = items
         return model
 
-    await state_mutate(_self_scope(bot_id), _SELF_MODEL_KEY, _mutate)
+    await state_mutate(_self_scope(bot_id, persona_name), _SELF_MODEL_KEY, _mutate)
     # 同步认知节点：让「我记过什么」能被 search_cognition 命中，而不是只能等
     # 下一轮稳定前缀。称呼/禁忌这类**规则**优先落 AIMemPreference，此处只留非规则反思。
     from gsuid_core.ai_core.cognition.distill import distill_self_note
 
-    await distill_self_note(note=content, note_type=field, bot_id=bot_id)
+    await distill_self_note(note=content, note_type=field, bot_id=bot_id, persona_name=persona_name)
     logger.debug(
         i18n_t(
             "log.ai.selfcog_bot_id_self_model_field",
@@ -202,6 +203,7 @@ async def add_self_note(
 
 async def overwrite_self_model_field(
     bot_id: str,
+    persona_name: str,
     field: str,
     items: List[str],
 ) -> bool:
@@ -235,7 +237,7 @@ async def overwrite_self_model_field(
         model[field] = cleaned
         return model
 
-    await state_mutate(_self_scope(bot_id), _SELF_MODEL_KEY, _mutate)
+    await state_mutate(_self_scope(bot_id, persona_name), _SELF_MODEL_KEY, _mutate)
     logger.info(
         i18n_t(
             "log.ai.selfcog_bot_id_self_field",
@@ -247,7 +249,7 @@ async def overwrite_self_model_field(
     return True
 
 
-async def retrieve_self_episodes(bot_id: str, limit: int = 3) -> str:
+async def retrieve_self_episodes(bot_id: str, persona_name: str, limit: int = 3) -> str:
     """检索 Bot 自身的情景记忆（"我之前说过/做过什么"），返回可注入文本（C3-c）。
 
     取 SELF scope 下最近的 Episode。仅在用户消息含回指词（"你之前/你不是说/
@@ -265,12 +267,12 @@ async def retrieve_self_episodes(bot_id: str, limit: int = 3) -> str:
     from gsuid_core.utils.database.base_models import async_maker
     from gsuid_core.ai_core.memory.database.models import AIMemEpisode
 
-    scope_key = make_scope_key(ScopeType.SELF, bot_id or "default")
+    scope_keys = self_scope_read_keys(bot_id or "default", persona_name)
     try:
         async with async_maker() as session:
             result = await session.execute(
                 select(AIMemEpisode)
-                .where(col(AIMemEpisode.scope_key) == scope_key)
+                .where(col(AIMemEpisode.scope_key).in_(scope_keys))
                 .order_by(col(AIMemEpisode.valid_at).desc())
                 .limit(limit)
             )
@@ -346,6 +348,7 @@ async def _compute_live_recurring_topics(
 
 async def build_self_cognition_context(
     bot_id: str,
+    persona_name: str,
     rel: Optional["RelationshipView"] = None,
     scope_key: Optional[str] = None,
     include_relationship: bool = True,
@@ -370,9 +373,9 @@ async def build_self_cognition_context(
     Returns:
         可直接注入的文本块；无任何可注入内容时返回空串。
     """
-    model = await get_self_model(bot_id)
+    model = await get_self_model(bot_id, persona_name)
     lines: List[str] = ["【关于我自己（仅供参考）】"]
-    ontology = await ensure_self_ontology(bot_id)
+    ontology = await ensure_self_ontology(bot_id, persona_name)
     if ontology:
         lines.append("【我是什么】")
         lines.append(ontology)
@@ -413,9 +416,75 @@ def note_applies_to_speaker(note: str, speaker_id: str) -> bool:
     return speaker_id in pinned
 
 
+_NEG_MARKERS = (
+    "不要",
+    "不用",
+    "不能",
+    "不可",
+    "别",
+    "勿",
+    "禁止",
+    "严禁",
+    "避免",
+    "不",
+    "never",
+    "don't",
+    "dont",
+    "avoid",
+    "no ",
+)
+
+
+def _has_negation_marker(text: str) -> bool:
+    low = text.lower()
+    return any(m in low for m in _NEG_MARKERS)
+
+
+def _rule_subsumed(new_rule: str, existing_rules: Sequence[str]) -> bool:
+    """通用子串包含与二元组重叠去重，不依赖任何特定业务词表或正则。"""
+    n_clean = "".join(c for c in new_rule.lower() if c.isalnum() or "\u4e00" <= c <= "\u9fff")
+    if not n_clean:
+        return True
+    n_neg = _has_negation_marker(new_rule)
+    for ex in existing_rules:
+        if _has_negation_marker(ex) != n_neg:
+            continue
+        e_clean = "".join(c for c in ex.lower() if c.isalnum() or "\u4e00" <= c <= "\u9fff")
+        if not e_clean:
+            continue
+        if n_clean == e_clean:
+            return True
+        if len(n_clean) >= 2 and n_clean in e_clean:
+            return True
+        if len(e_clean) >= 2 and e_clean in n_clean:
+            return True
+        g_n = set(n_clean[i : i + 2] for i in range(len(n_clean) - 1))
+        g_e = set(e_clean[i : i + 2] for i in range(len(e_clean) - 1))
+        if g_n and g_e and (len(g_n & g_e) / len(g_n | g_e)) >= 0.65:
+            return True
+    return False
+
+
+def _pref_tier(ctx: str, is_corr: bool, polarity: str = "do") -> int:
+    """偏好优先级分层：纠错 > 否定约束 > 常驻画像 > 通用偏好 > 其它上下文。"""
+    if is_corr:
+        return 0
+    if polarity == "dont":
+        return 1
+    if ctx in _STANDING_PREF_CONTEXTS:
+        return 2
+    if ctx == "general":
+        return 3
+    return 4
+
+
 def collect_speaker_preference_rules(
     notes: list[str],
-    scoped_rules: Sequence[tuple[str, str, bool] | tuple[str, str, bool, Optional[datetime]]],
+    scoped_rules: Sequence[
+        tuple[str, str, bool]
+        | tuple[str, str, bool, Optional[datetime]]
+        | tuple[str, str, bool, Optional[datetime], str]
+    ],
     speaker_id: str,
     *,
     limit: int,
@@ -424,12 +493,21 @@ def collect_speaker_preference_rules(
     out: list[str] = []
     seen: set[str] = set()
 
+    def _pref_normalize_fingerprint(text: str, sid: str) -> str:
+        cleaned = re.sub(r"^\[[\d.\-]+\]\s*", "", text.strip())
+        if sid:
+            cleaned = re.sub(rf"用户\s*\(?user_id:\s*{re.escape(sid)}\)?|用户\s*{re.escape(sid)}", "用户", cleaned)
+        cleaned = re.sub(r'[\s，。；,;：:！!？?"\'「」()（）]', "", cleaned).lower()
+        return cleaned
+
     def push(text: str) -> None:
         body = text.strip()
         if not body or len(out) >= limit:
             return
-        key = body.lower().replace(" ", "").rstrip("。，.,!！")
+        key = _pref_normalize_fingerprint(body, speaker_id)
         if key in seen:
+            return
+        if any(key in prev or prev in key for prev in seen if len(key) >= 4 and len(prev) >= 4):
             return
         seen.add(key)
         out.append(body)
@@ -437,15 +515,26 @@ def collect_speaker_preference_rules(
     ranked = sorted(
         scoped_rules,
         key=lambda item: (
-            0 if item[0] in _STANDING_PREF_CONTEXTS else (1 if item[2] else 2),
-            item[0],
+            _pref_tier(
+                item[0],
+                item[2],
+                item[4] if len(item) > 4 and isinstance(item[4], str) else "do",
+            ),
+            -(item[3].timestamp() if len(item) > 3 and item[3] is not None else 0),
         ),
     )
     now = datetime.now(timezone.utc)
+    seen_by_context: dict[tuple[str, str], list[str]] = {}
     for item in ranked:
         ctx = item[0]
         rule = item[1]
         created_at: datetime | None = item[3] if len(item) > 3 else None
+        polarity = item[4] if len(item) > 4 and isinstance(item[4], str) else "do"
+        existing_in_ctx = seen_by_context.setdefault((ctx, polarity), [])
+        if _rule_subsumed(rule, existing_in_ctx):
+            continue
+        existing_in_ctx.append(rule)
+
         tag = f"{ctx}：" if ctx and ctx != "general" else ""
         date_prefix = f"[{preference_written_on(created_at)}] " if created_at is not None else ""
         exp_tag = ""
@@ -466,11 +555,34 @@ def render_speaker_preference_tail(rules: list[str]) -> str:
     """当前说话人的偏好。拼在本轮 user 尾，入史前不留。"""
     if not rules:
         return ""
-    lines = [f"• {rule}" for rule in rules]
-    return "【当前说话人的偏好】只约束这一轮的说话人。问句里没写到这些词也要遵守；别的群友不适用。\n" + "\n".join(lines)
+    behavioral: list[str] = []
+    trivia: list[str] = []
+    for r in rules:
+        core = r.split("] ", 1)[-1] if r.startswith("[") and "] " in r else r
+        if "：" in core and not core.startswith("general："):
+            trivia.append(r)
+        else:
+            behavioral.append(r)
+
+    parts: list[str] = []
+    if behavioral:
+        header = "【当前说话人要求与习惯】只约束这一轮说话人；问句里没写到这些词也要遵守："
+        lines = [f"• {rule}" for rule in behavioral]
+        parts.append(f"{header}\n" + "\n".join(lines))
+    if trivia:
+        header = "【当前说话人背景】未被问及时无需刻意提及："
+        lines = [f"• {rule}" for rule in trivia]
+        parts.append(f"{header}\n" + "\n".join(lines))
+    return "\n\n".join(parts)
 
 
-async def load_speaker_preference_tail(bot_id: str, speaker_id: str) -> str:
+async def load_speaker_preference_tail(
+    bot_id: str,
+    persona_name: str,
+    speaker_id: str,
+    *,
+    existing_text: str = "",
+) -> str:
     """读这个人的 USER_GLOBAL 偏好和他名下的自我笔记。库未建则空。"""
     speaker = speaker_id.strip()
     if not speaker:
@@ -481,8 +593,8 @@ async def load_speaker_preference_tail(bot_id: str, speaker_id: str) -> str:
         return ""
     from gsuid_core.ai_core.memory.config import memory_config
 
-    model = await get_self_model(bot_id)
-    scoped: list[tuple[str, str, bool, Optional[datetime]]] = []
+    model = await get_self_model(bot_id, persona_name)
+    scoped: list[tuple[str, str, bool, Optional[datetime], str]] = []
     if memory_config.enable_preference_memory:
         from gsuid_core.ai_core.memory.database.models import AIMemPreference
 
@@ -491,19 +603,33 @@ async def load_speaker_preference_tail(bot_id: str, speaker_id: str) -> str:
         standing_rows = await AIMemPreference.get_active(
             [scope],
             target_contexts=list(_STANDING_PREF_CONTEXTS),
-            limit=cap,
+            limit=min(cap, 2),
         )
         other_rows = await AIMemPreference.get_active([scope], limit=cap * 3)
         seen_ids: set[str] = set()
         merged: list[AIMemPreference] = []
-        for row in standing_rows + other_rows:
+        for row in standing_rows:
             if row.id in seen_ids:
+                continue
+            if existing_text and row.preference_rule.strip() and row.preference_rule.strip() in existing_text:
                 continue
             seen_ids.add(row.id)
             merged.append(row)
-        scoped = [(row.target_context, row.preference_rule, row.is_correction, row.created_at) for row in merged]
+        for row in other_rows:
+            if row.id in seen_ids or row.target_context == "possession":
+                continue
+            if existing_text and row.preference_rule.strip() and row.preference_rule.strip() in existing_text:
+                continue
+            seen_ids.add(row.id)
+            merged.append(row)
+        scoped = [
+            (row.target_context, row.preference_rule, row.is_correction, row.created_at, row.polarity) for row in merged
+        ]
+    notes = [
+        n for n in model["preferences_learned"] if not (existing_text and n.strip() and n.strip() in existing_text)
+    ]
     rules = collect_speaker_preference_rules(
-        model["preferences_learned"],
+        notes,
         scoped,
         speaker,
         limit=int(memory_config.preference_max_inject),
@@ -518,4 +644,9 @@ def build_relationship_context(rel: "RelationshipView") -> str:
     群聊共享 session 下必须每轮按当前对话者单独给出——括号包裹暗示是背景感知。
     文案不再自划档：唯一来源是 ``relationship.zones``（见 ``RelationshipView.line``）。
     """
-    return f"（{rel.line}）"
+    body = f"（{rel.line}）"
+    if rel.vibe:
+        body += f"（你们平时：{rel.vibe}）"
+    if rel.callbacks:
+        body += f"（你们的老梗：{'；'.join(rel.callbacks)}）"
+    return body

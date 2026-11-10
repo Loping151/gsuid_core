@@ -10,6 +10,7 @@ fail_task_tree 重建（参见 docs/AI_AGENT_ARCHITECTURE.md §3.5 持久化产�
 """
 
 from typing import Optional
+from datetime import datetime, timedelta
 
 from gsuid_core.i18n import t as i18n_t
 from gsuid_core.logger import logger
@@ -28,6 +29,7 @@ _STATUS_CN: dict[str, str] = {
     "paused": "已暂停",
     "waiting_approval": "等待审批",
     "completed": "已完成",
+    "skipped": "已跳过",
     "failed": "失败",
     "cancelled": "已取消",
 }
@@ -35,6 +37,22 @@ _STATUS_CN: dict[str, str] = {
 
 def _status_cn(s: str) -> str:
     return _STATUS_CN[s] if s in _STATUS_CN else s
+
+
+_ZOMBIE_TASK_HOURS = 24
+
+
+def _is_zombie_task(t: AIAgentTask, now: datetime) -> bool:
+    if t.recurring_trigger:
+        return False
+    if not t.updated_at:
+        return False
+    upd = t.updated_at
+    if upd.tzinfo is not None and now.tzinfo is None:
+        now = now.replace(tzinfo=upd.tzinfo)
+    elif upd.tzinfo is None and now.tzinfo is not None:
+        upd = upd.replace(tzinfo=now.tzinfo)
+    return (now - upd) > timedelta(hours=_ZOMBIE_TASK_HOURS)
 
 
 async def build_task_context(user_id: str, current_group_id: Optional[str] = None) -> str:
@@ -53,8 +71,13 @@ async def build_task_context(user_id: str, current_group_id: Optional[str] = Non
         return ""
 
     other_scope_count = 0
+    now = datetime.now()
+    tasks = [t for t in tasks if not _is_zombie_task(t, now)]
+    if not tasks:
+        return ""
+
     if current_group_id is not None:
-        visible: list = []
+        visible: list[AIAgentTask] = []
         for t in tasks:
             # 私聊任务（group_id 空）对群同样是"其他会话"：详情不进群上下文（评审修复 F12）
             if str(t.group_id or "") != str(current_group_id):
@@ -62,6 +85,8 @@ async def build_task_context(user_id: str, current_group_id: Optional[str] = Non
             else:
                 visible.append(t)
         tasks = visible
+    if not tasks:
+        return ""
 
     lines = ["【你正在为对方推进的事项（可被追问进度；对用户只说人话，勿念编号/节点名）】"]
     if other_scope_count:
@@ -129,7 +154,7 @@ async def has_actionable_task(user_id: str, current_group_id: Optional[str] = No
 
     与 ``build_task_context`` 的"只要活跃就注入"不同，本函数只关心此刻
     真有子步骤 ``running`` / ``waiting_approval`` 的根——这时主人格随时
-    可能需要 fail_task_tree / respond_approval。
+    可能需要 fail_task_tree。审批不由模型转达。
     ``pending`` / ``paused``（如十几天后的周期模板）和两轮之间空转的周期托管根
     不触发，避免闲聊时无谓挂载 planning 工具、把每一轮都当成任务轮。
 
@@ -138,6 +163,8 @@ async def has_actionable_task(user_id: str, current_group_id: Optional[str] = No
     """
     try:
         tasks = await AIAgentTask.list_for_owner(str(user_id), only_active=True, root_only=True)
+        now = datetime.now()
+        tasks = [t for t in tasks if not _is_zombie_task(t, now)]
         if current_group_id is not None:
             tasks = [t for t in tasks if str(t.group_id or "") == str(current_group_id)]
         counts = await AIAgentTask.child_status_counts([t.id for t in tasks if t.status == "running"])

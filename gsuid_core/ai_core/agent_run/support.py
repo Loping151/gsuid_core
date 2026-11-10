@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import re
+import json
 from typing import Dict, List, Tuple, Union, Literal, Optional, Sequence
 
 from pydantic_ai.messages import (
@@ -20,26 +21,24 @@ from pydantic_ai.messages import (
 from gsuid_core.models import Event
 from gsuid_core.ai_core.utils import _is_framework_prompt_content
 from gsuid_core.ai_core.rag.tools import NON_SEARCHABLE_TOOL_CATEGORIES
+from gsuid_core.ai_core.control.lines import THRASH_FUSE_NUDGE as _THRASH_FUSE_NUDGE  # noqa: F401
+from gsuid_core.ai_core.session_logger import AISessionLogger
 from gsuid_core.ai_core.agent_run.state import RunOnceState
 from gsuid_core.ai_core.control.directive import CONTROL_ENVELOPE_TAG
 
 # re-export：settle / prepare / gs_agent 与测试共用
 from gsuid_core.ai_core.agent_run.speech_policy import (  # noqa: F401
-    _WALL_CLOCK_CLOSE as _WALL_CLOCK_NUDGE,
     STATUS_INQUIRY_HINT as _STATUS_INQUIRY_HINT,
     _REPORT_SPEECH_NUDGE,
-    _WALL_CLOCK_PIPELINE,
     _RENDER_DELEGATE_NUDGE,
     _STATUS_ZERO_TOOL_NUDGE,
-    _WALL_CLOCK_CLOSE_NO_RENDER,
-    wall_clock_nudge_for as _wall_clock_nudge_for,
     looks_like_report_speech as _looks_like_report_speech,
 )
 from gsuid_core.ai_core.capability_agents.delegation_contracts import (
     tool_call_targets_render_agent as _tool_call_targets_render_agent_core,
 )
 
-# 写入类日程工具：PIN 拒绝或失败不算生效。list 只读，不算。
+# 写入类日程/看板工具：PIN 拒绝或失败不算生效。list/evaluate 只读，不算。
 _EFFECTUAL_WRITE_TOOLS: frozenset[str] = frozenset(
     {
         "add_once_task",
@@ -48,6 +47,12 @@ _EFFECTUAL_WRITE_TOOLS: frozenset[str] = frozenset(
         "cancel_scheduled_task",
         "pause_scheduled_task",
         "resume_scheduled_task",
+        "register_kanban_task",
+        "respawn_subtask",
+        "fail_task_tree",
+        "pause_my_kanban_tree",
+        "resume_my_kanban_tree",
+        "disarm_my_recurring_template",
     }
 )
 
@@ -74,7 +79,7 @@ def _tool_return_is_effectual_write(name: str, content: str, *, failed: bool) ->
 
 
 # 须与 capability_agents.runner.CAPABILITY_AGENT_ERROR_PREFIX 同前缀，供看板认失败。
-_MAX_ITER_INTERNAL = "⚠️ 能力代理执行失败: 已达最大思考轮数，未能在限定步数内完成本任务。中间产物已留在工作区。"
+_MAX_ITER_INTERNAL = "⚠️ 能力代理执行失败: 已达最大思考轮数，未能在限定步数内完成本任务。已收集的材料不够收成交付。"
 _MAX_ITER_VISIBLE = (
     "⚠️ 已达最大思考轮数，未能在限定步数内完成本任务。"
     "中间产物（如已写入的文件 / artifact）已留在工作区，未回传以避免刷屏。"
@@ -180,6 +185,57 @@ def _first_real_user_prompt_part(history: Sequence[ModelMessage]) -> Optional[Us
     return None
 
 
+_SESSION_ANCHOR_NEEDLE = "【生活手账】"
+
+
+def _ensure_session_anchor_on_first_user(
+    history: Sequence[ModelMessage],
+    current: UserTurnText,
+    lean: UserTurnText,
+    *,
+    persona_name: str = "",
+    group_id: Optional[str] = None,
+    marker: str = "",
+    is_framework: bool = False,
+) -> Tuple[UserTurnText, UserTurnText, InnerOsInjectWhere, float]:
+    """会话首轮锚点（生活手账 + INNER_OS），只往当前 request 追加，持久后进入 history[0]。"""
+    if is_framework:
+        return current, lean, "skipped", 0.0
+
+    first = _first_real_user_prompt_part(history)
+    if first is not None:
+        return current, lean, "already", 0.0
+
+    if _user_content_contains(current, _SESSION_ANCHOR_NEEDLE) or (
+        marker and _user_content_contains(current, _INNER_OS_NEEDLE)
+    ):
+        return current, lean, "already", 0.0
+
+    anchor_parts: List[str] = []
+    latest_ts = 0.0
+    if persona_name:
+        from gsuid_core.ai_core.journal.manager import read_journal_for_context
+
+        journal_text, latest_ts = read_journal_for_context(
+            persona_name,
+            current_group_id=group_id,
+            since_ts=0.0,
+        )
+        if journal_text:
+            anchor_parts.append(f"\n\n【生活手账】\n{journal_text}")
+
+    if marker:
+        anchor_parts.append(marker)
+
+    if not anchor_parts:
+        return current, lean, "skipped", 0.0
+
+    combined = "".join(anchor_parts)
+    new_current = _append_user_text(current, combined)
+    new_lean = _append_user_text(lean, combined) if lean else lean
+    return new_current, new_lean, "current", latest_ts
+
+
 def _ensure_inner_os_on_first_user(
     history: Sequence[ModelMessage],
     current: UserTurnText,
@@ -188,25 +244,22 @@ def _ensure_inner_os_on_first_user(
     *,
     is_framework: bool,
 ) -> Tuple[UserTurnText, UserTurnText, InnerOsInjectWhere]:
-    """INNER_OS 只往当前 request 追加，禁止改 history[0]。"""
-    if not marker:
-        return current, lean, "skipped"
-
-    first = _first_real_user_prompt_part(history)
-    if first is not None and _user_content_contains(first.content, _INNER_OS_NEEDLE):
-        return current, lean, "already"
-
-    if is_framework:
-        return current, lean, "skipped"
-    if _user_content_contains(current, _INNER_OS_NEEDLE):
-        return current, lean, "already"
-    new_current = _append_user_text(current, marker)
-    new_lean = _append_user_text(lean, marker) if lean else lean
-    return new_current, new_lean, "current"
+    """向后兼容封装：旧版 INNER_OS 单独注入。"""
+    cur, ln, where, _ = _ensure_session_anchor_on_first_user(
+        history,
+        current,
+        lean,
+        persona_name="",
+        marker=marker,
+        is_framework=is_framework,
+    )
+    return cur, ln, where
 
 
 # 交互式主 Agent 的 create_by 集合（交互脚手架/墙钟软预算适用范围；TEST=本地评测端点）
 _INTERACTIVE_CREATE_BY = ("Chat", "Agent", "TEST", "CapabilityAgent")
+# 思考轮数收口只给要交交付物的代理。主人格走强制总结，不插这句。
+_ITER_WRAP_CREATE_BY = frozenset({"CapabilityAgent", "AutoPlanner"})
 # 主会话才折叠 JSON；CapabilityAgent 必须看完整工具返回
 _MAIN_PERSONA_CREATE_BY = frozenset({"Chat", "Agent", "Plan"})
 
@@ -231,6 +284,14 @@ _SCHED_MUTATE_TOOLS: frozenset[str] = frozenset(
 )
 _MISSING_OFFERED_TOOL_RE = re.compile(r"没有.{0,16}工具")
 _DEFER_WORK_RE = re.compile(r"明天再|等我.{0,8}再(查|设|弄|翻)|等我.{0,16}(翻|查|搜)")
+_INFLIGHT_PROMISE_RE = re.compile(
+    r"(?:落好|搭好|挂好|建好|弄好|办好|做好|查好|画好|渲好|跑完|搭成|落成)之后.{0,10}(?:跟你说|叫你|喊你|唤你|告诉你|发你|给你)"
+    r"|搭成了.{0,8}先出.{0,6}给?你看"
+    r"|我还在(?:搭|挂|建|弄|配|改)[，,。；\s]"
+    r"|还在挂[，,。；\s]|挂在半路.{0,12}(?:盯到收口|接着)"
+    r"|我去把.{0,10}(?:重新系|接回去).{0,10}(?:一会儿|回头|稍后).{0,6}给?你"
+    r"|改完这一轮就停手.{0,10}下次再说"
+)
 
 
 def _claims_missing_offered_tool(text: str, offered: Sequence[str]) -> bool:
@@ -243,6 +304,14 @@ def _claims_missing_offered_tool(text: str, offered: Sequence[str]) -> bool:
 def _claims_deferred_work(text: str) -> bool:
     """把该办的事推到明天或「等我…再动手」。"""
     return bool(_DEFER_WORK_RE.search(text or ""))
+
+
+def _claims_inflight_without_backend(text: str) -> bool:
+    """对用户许下后台在途/完成后通知的承诺（无后台任务支撑时拦截）。"""
+    body = (text or "").strip()
+    if not body or _FAKE_DONE_QUESTION_RE.search(body):
+        return False
+    return bool(_INFLIGHT_PROMISE_RE.search(body))
 
 
 # 结构假完成：被呼叫 + 池内有工具 + 零调用 + 非沉默/非极短寒暄（不解析用户话题词）
@@ -275,52 +344,82 @@ def _correction_nudge_markers() -> tuple[str, ...]:
 
 
 _RENDER_TOOL_NAMES = frozenset({"render_html_to_image", "render_card", "render_markdown_to_image"})
-# find_tools 连打 2 轮即空转。search_cognition 换槽位词会召回不同片段，不能按同名 2 轮熔断。
-_FIND_TOOLS_THRASH_LIMIT = 2
-_SEARCH_COGNITION_THRASH_LIMIT = 8
-_READONLY_RETRIEVAL_TOOLS = frozenset({"find_tools"})
 # 搜索/拉取类返回「够长+多行」即视为可出图材料（不靠业务词）
 _SEARCHISH_TOOL_HINTS = ("search", "web_", "fetch", "knowledge")
+# 工具名和参数都相同，连续超过此次数才算空转。换参数（如逐题点击）不累计。
+_THRASH_SAME_TOOL_LIMIT = 10
 
 
 def thrash_limit_for(tool_name: str) -> int:
-    """该工具的同名连打熔断阈值。find_tools 更严（2 轮），search_cognition 8 轮，其余 4 轮。"""
-    if tool_name == "search_cognition":
-        return _SEARCH_COGNITION_THRASH_LIMIT
-    if tool_name in _READONLY_RETRIEVAL_TOOLS:
-        return _FIND_TOOLS_THRASH_LIMIT
+    """同一调用连续超过这个次数才熔断。不看工具名本身。"""
+    _ = tool_name
     return _THRASH_SAME_TOOL_LIMIT
 
 
-# 同工具空转熔断：跨轮连续 ≥4 轮仅调用同一工具时注入收敛提示，避免死循环。
-_THRASH_SAME_TOOL_LIMIT = 4
-_THRASH_FUSE_NUDGE = (
-    "（系统校验：你已跨多轮连续只重复同一工具，仍无新进展。立即停止再连打该工具；"
-    "换另一路径（如 find_tools / 其它工具）或基于已有结果交付结论，禁止空转。）"
-)
+def canonical_tool_call(tool_name: str, args: object) -> str:
+    """工具名加规范化参数。键顺序和空白不同仍算同一次调用。"""
+    name = (tool_name or "").strip()
+    return f"{name}\n{_canonical_tool_args(args)}"
+
+
+def _canonical_tool_args(args: object) -> str:
+    if isinstance(args, str):
+        text = args.strip()
+        if text[:1] in "{[":
+            try:
+                parsed: object = json.loads(text)
+            except json.JSONDecodeError:
+                return text
+            if isinstance(parsed, (dict, list, str, int, float, bool)) or parsed is None:
+                return _canonical_tool_args(parsed)
+            return text
+        return text
+    if isinstance(args, dict):
+        parts: list[str] = []
+        for key in sorted(k for k in args if isinstance(k, str)):
+            parts.append(json.dumps(key, ensure_ascii=False) + ":" + _canonical_tool_args(args[key]))
+        return "{" + ",".join(parts) + "}"
+    if isinstance(args, list):
+        return "[" + ",".join(_canonical_tool_args(item) for item in args) + "]"
+    if args is None or isinstance(args, (str, int, float, bool)):
+        return json.dumps(args, ensure_ascii=False)
+    return json.dumps(str(args), ensure_ascii=False)
+
+
+_UNFINISHED_CAPABILITY_BANNER = "【未写成结论】执行体停在中途。下面是最后一次工具返回，不是最终结果。"
+
+
+def result_silence_reason(text: str, *, existing: str, blocked: str) -> str | None:
+    """空正文和沉默标签分开记。模型没打沉默标签时，不写成自己选择沉默。"""
+    from gsuid_core.ai_core.utils import is_silence_marker
+
+    body = text.strip()
+    if is_silence_marker(body):
+        return existing or "model_voluntary"
+    if not body:
+        return existing or blocked or "empty_output"
+    return None
 
 
 def _update_thrash_streak_for_response(
-    tool_names: Sequence[str],
+    calls: Sequence[str],
     *,
-    prev_name: str,
+    prev_signature: str,
     prev_streak: int,
 ) -> tuple[str, int]:
-    """根据本 ModelResponse 的工具名列表更新 thrash 状态。
+    """按「工具名 + 参数」更新空转计数。纯文本轮不重置。
 
-    - 无工具调用：保持原 streak（纯文本轮不重置、也不累加）
-    - 本响应混用多种工具：重置
-    - 本响应仅一种工具（含并行多 call）：同名则 +1 轮，换名则 streak=1
+    本响应只有一种调用（含并行多次相同参数）才 +1。参数不同或混用多种工具则重置。
     """
-    if not tool_names:
-        return prev_name, prev_streak
-    unique = {n for n in tool_names if n}
+    if not calls:
+        return prev_signature, prev_streak
+    unique = {call for call in calls if call}
     if len(unique) != 1:
         return "", 0
-    name = next(iter(unique))
-    if name == prev_name:
-        return name, prev_streak + 1
-    return name, 1
+    signature = next(iter(unique))
+    if signature == prev_signature:
+        return signature, prev_streak + 1
+    return signature, 1
 
 
 def _matched_delegation_only_profile(query: str) -> str:
@@ -526,6 +625,77 @@ def collect_run_thinking(segments: Sequence[str]) -> str:
     if len(body) <= RUN_THINKING_BUDGET:
         return body
     return "…[前略]" + body[-RUN_THINKING_BUDGET:]
+
+
+def iter_wrap_due(
+    *,
+    requests_started: int,
+    request_limit: int | None,
+    return_mode: str,
+    create_by: str,
+    already_nudged: bool,
+) -> bool:
+    """倒数第二次模型请求才收口：这一轮落盘，下一轮写句柄。"""
+    if already_nudged or return_mode != "return":
+        return False
+    if create_by not in _ITER_WRAP_CREATE_BY:
+        return False
+    if request_limit is None or request_limit < 4:
+        return False
+    return requests_started == request_limit - 1
+
+
+def add_response_usage(
+    st: RunOnceState,
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int,
+    cache_write_tokens: int,
+    response_model: str | None,
+) -> None:
+    """按单次模型响应累加。超轮数没有 result.usage，会话日志靠这份合计。"""
+    st.usage_input_tokens += input_tokens
+    st.usage_output_tokens += output_tokens
+    st.usage_cache_read_tokens += cache_read_tokens
+    st.usage_cache_write_tokens += cache_write_tokens
+    if response_model and st.model_name in ("", "unknown"):
+        st.model_name = response_model
+
+
+def log_output_block_on_session(
+    session_id: str,
+    reason: str,
+    content: str,
+    *,
+    policy: str = "",
+    tool_call_id: str = "",
+) -> None:
+    """工具路径没有 RunOnceState 时，按 session 记下被吞的台词。"""
+    sid = session_id.strip()
+    why = reason.strip()
+    body = content.strip()
+    if not sid or not why or not body:
+        return
+    from gsuid_core.ai_core.session_registry import get_ai_session_registry
+
+    sess = get_ai_session_registry().get_ai_session(sid)
+    if sess is None or sess._session_logger is None:
+        return
+    sess._session_logger.log_output_block(why, body, policy=policy, tool_call_id=tool_call_id)
+
+
+def record_output_block(st: RunOnceState, logger: AISessionLogger, reason: str, content: str) -> None:
+    """拦截当时把原因码和原文写入会话日志。同一 run 相同原因与原文只记一次。"""
+    body = (content or "").strip()
+    why = (reason or "").strip()
+    if not body or not why:
+        return
+    key = (why, body)
+    if key in st.output_block_seen:
+        return
+    st.output_block_seen.add(key)
+    logger.log_output_block(why, body, policy=st.speech_policy)
 
 
 def record_run_tool_output(outputs: List[str], tool_name: str, content: Optional[str]) -> None:

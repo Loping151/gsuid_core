@@ -15,6 +15,7 @@ from gsuid_core.logger import logger
 # 装配顺序单源定义：内核处理身份与历史，群语境位于记忆之前，规划提示紧跟任务之后。
 CONTEXT_BLOCK_ORDER: Tuple[str, ...] = (
     "mood",
+    "presence",
     "relationship",
     "voice_anchor",
     "identity",
@@ -34,8 +35,10 @@ CONTEXT_BLOCK_ORDER: Tuple[str, ...] = (
 # 它的帽只能来自 inject_memory_cap，表里再写一个 8000 会让配置形同虚设。
 BLOCK_CHAR_BUDGET: Mapping[str, int] = {
     "mood": 80,
-    "relationship": 100,
-    "voice_anchor": 180,
+    "presence": 120,
+    "relationship": 220,
+    # 口吻 86 + 敌对档口气 60 + 复读提示 60 左右
+    "voice_anchor": 240,
     "identity": 80,
     # 同人线程 14 条 + 旁人 6 条；600 会从尾部截掉最新出站句柄。
     "history": 4000,
@@ -69,14 +72,20 @@ def count_document_sources(text: str) -> int:
     return len(seen)
 
 
-def inject_memory_cap(query: str, *, covered: bool = False, n_doc_sources: int = 0) -> int:
-    """记忆整块总帽的**唯一**出口：pack 与 join 都调这里，两边不会各抬一个数。
-
-    只按「有没有逐份材料覆盖 / 问句是不是长时序或跨文档比较」选档。覆盖守卫
-    （scope、≥2 份、栏目实词、df）决定摘哪些行，留在检索侧，不搬进预算函数。
-    """
+def inject_memory_cap(
+    query: str,
+    *,
+    covered: bool = False,
+    n_doc_sources: int = 0,
+    memory_intent: str = "point_latest",
+) -> int:
+    """记忆整块总帽的**唯一**出口：pack 与 join 都调这里，两边不会各抬一个数。"""
     from gsuid_core.ai_core.memory.config import memory_config
-    from gsuid_core.ai_core.memory.retrieval.lexical import wants_parallel_document_coverage
+    from gsuid_core.ai_core.memory.retrieval.lexical import (
+        looks_like_sum_query,
+        looks_like_count_query,
+        wants_parallel_document_coverage,
+    )
     from gsuid_core.ai_core.memory.retrieval.event_time import (
         looks_like_span_query,
         looks_like_order_query,
@@ -86,7 +95,14 @@ def inject_memory_cap(query: str, *, covered: bool = False, n_doc_sources: int =
     default = int(memory_config.memory_inject_max_chars)
     wide = max(default, int(memory_config.memory_inject_wide_chars))
     multi_source = n_doc_sources >= _MEMORY_WIDE_MIN_DOC_SOURCES
-    timeline = looks_like_order_query(query) or looks_like_span_query(query) or looks_like_summary_query(query)
+    timeline = (
+        memory_intent in ("timeline_order", "version_diff", "broad_summary")
+        or looks_like_order_query(query)
+        or looks_like_span_query(query)
+        or looks_like_summary_query(query)
+        or looks_like_count_query(query)
+        or looks_like_sum_query(query)
+    )
     if covered or multi_source or timeline or wants_parallel_document_coverage(query):
         return wide
     return default

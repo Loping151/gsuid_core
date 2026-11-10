@@ -13,6 +13,7 @@ from gsuid_core.ai_core.models import ToolContext
 from gsuid_core.ai_core.register import ai_tools
 from gsuid_core.ai_core.web_search import web_search
 from gsuid_core.ai_core.configs.ai_config import ai_config
+from gsuid_core.ai_core.web_search.date_utils import normalize_published_date
 
 
 def _format_results_for_model(results: list[dict], query: str = "") -> str:
@@ -52,6 +53,9 @@ def _format_results_for_model(results: list[dict], query: str = "") -> str:
         title = (item.get("title") or "").strip()
         url = (item.get("url") or "").strip()
         content = (item.get("content") or "").strip()
+        published = ""
+        if "published_date" in item and item["published_date"] is not None:
+            published = normalize_published_date(item["published_date"])
         if kind == "image" or image_url:
             img_i += 1
             img = image_url or url
@@ -65,6 +69,8 @@ def _format_results_for_model(results: list[dict], query: str = "") -> str:
         lines.append(f"[{text_i}]" + (f" {title}" if title else ""))
         if url:
             lines.append(url)
+        if published:
+            lines.append(f"published: {published}")
         if content:
             lines.append(content)
         # 个别 provider 在正文结果上附带缩略图
@@ -82,7 +88,7 @@ def _format_results_for_model(results: list[dict], query: str = "") -> str:
     category="buildin",
     timeout=100.0,
     code_callable=True,
-    covers=["网页搜索", "网络检索", "天气查询", "新闻资讯", "外网搜索"],
+    covers=["网页搜索", "网络检索", "天气查询", "今天天气", "天气预报", "查天气", "实时天气", "新闻资讯", "外网搜索"],
 )
 async def web_search_tool(
     ctx: RunContext[ToolContext],

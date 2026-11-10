@@ -10,7 +10,7 @@ description: >
   "MCP Server 怎么鉴权 / 过滤导出工具 / 补 Event 会话字段"、
   "ToolContext / ToolBase / KnowledgePoint / ImageEntity 是什么类型"、
   "buildin 都有哪些内置工具"、"get_registered_tools / get_all_tools 怎么查"、
-  "send_meme / collect_meme / understand_image / web_search 怎么用"时触发此 SKILL。
+  "collect_meme / understand_image / web_search 怎么用"时触发此 SKILL。
   对所有「插件作者要对接 AI Core 提供的 API」的任务都应优先读取此 SKILL。
 
   GsCore（早柚核心 / gsuid-core）`gsuid_core/ai_core/` 模块的完整 API 速查手册。
@@ -54,7 +54,7 @@ description: >
 | 八 | Persona 角色系统 + Memory 记忆系统（Persona 类、build_persona_prompt、`memory_config` / `dual_route_retrieve` / `observe`） | [references/08-persona-and-memory.md](./references/08-persona-and-memory.md) |
 | 九 | Scheduled Task 定时任务（`AIScheduledTask` 数据模型） | [references/09-scheduled-tasks.md](./references/09-scheduled-tasks.md) |
 | 十 | 工具注册表查询 API + 全部类型定义（`get_registered_tools` / `get_all_tools` / `ToolBase` / `ToolContext` / `KnowledgeBase` / `KnowledgePoint` / `ManualKnowledgeBase` / `ImageEntity` / `CheckFunc`） | [references/10-registry-and-types.md](./references/10-registry-and-types.md) |
-| 十一 | MCP（含 **Server 插件钩子**）+ Image Understand + **Web Search（Tavily 默认 + 多源）** + **Web Fetch（Jina/local）** + Meme | [references/11-mcp-image-search-and-meme.md](./references/11-mcp-image-search-and-meme.md) |
+| 十一 | MCP（含 **Server 插件钩子**）+ Image Understand + **Web Search（Tavily 默认 + 多源）** + **Web Fetch（Jina/DeepSeek/Exa/local）** + Meme | [references/11-mcp-image-search-and-meme.md](./references/11-mcp-image-search-and-meme.md) |
 | 十二 | 嵌入 Provider 注册表（`register_embedding_provider` / `EmbeddingProviderEntry` 字段 / 懒 import 工厂模式 / 降级策略） | [references/12-embedding-provider.md](./references/12-embedding-provider.md) |
 | 十三 | 完整示例 + 常见问题（基础工具注册 / 翻译 Agent / 插件入口 / 6 条 FAQ） | [references/13-full-examples-and-faq.md](./references/13-full-examples-and-faq.md) |
 
@@ -82,7 +82,7 @@ description: >
 - **`category` 决定加载方式**：`self` / `buildin` 是**框架保底工具池**（无条件全部加载进主Agent，不受向量搜索影响）；`common` / `media` / `mcp` / 自定义分类是**向量检索按需加载**；`default` 是**子Agent 工具**（需通过 `create_subagent` 调用）。详见 [§3.2](./references/03-tool-categories.md)。
 - **保底池由 category 决定，无硬编码名单**：`get_main_agent_tools()` 把 `self` + `buildin` 两个分类下的全部工具无条件加载；插件若希望某工具成为主 Agent 保底工具，注册时用 `category="buildin"` 即可。详见 [§3.2](./references/03-tool-categories.md)。
 - **`to_ai` 与 `@ai_tools` 冲突不可共存**：同一函数**只能选其一**。命令同时允许用户直接触发 → `to_ai`（一份代码服务用户命令 + AI 调用）；纯 AI 内部工具 → `@ai_tools`。详见 [§四 顶部警告](./references/04-trigger-bridge.md)。
-- **`MockBot` 拦截 `bot.send`**：AI 调用触发器时，真实 `Bot` 被 `MockBot` 代理——`bot.send(bytes)` / `bot.send("base64://...")` / `bot.send(Message(type="image"))` 都会通过 `RM.register()` 注册图片，**返回资源 ID**（如 `img_a1b2c3d4`），AI 据此决定是否调 `send_message_by_ai(image_id=...)` 发给用户；纯文字 `bot.send(str)` 被自动收集返回给 AI。详见 [§4.4](./references/04-trigger-bridge.md)。
+- **`MockBot` 拦截 `bot.send`**：AI 调用触发器时，真实 `Bot` 被 `MockBot` 代理——`bot.send(bytes)` / `bot.send("base64://...")` / `bot.send(Message(type="image"))` 都会通过 `RM.register()` 注册图片，**返回资源 ID**（如 `img_a1b2c3d4`），AI 据此决定是否调 `send_message_by_ai(image_id=...)` 发给用户；`Message(type="file")` 经 `RM.register_file()` 登记为 `fil_` 句柄（≤10MB），AI 用 `file_ids=[...]` 发出；纯文字 `bot.send(str)` 被自动收集返回给 AI。详见 [§4.4](./references/04-trigger-bridge.md)。
 - **`context_tags` 解决群聊语境失配**：插件可通过 `context_tags=["原神", "Genshin", "游戏"]` 声明工具适用语境，框架根据群组画像把匹配标签的工具自动加入该群（最多 8 个），不依赖向量搜索。详见 [§2.2](./references/02-ai-tools-decorator.md)。
 - **`create_agent` 复用 Agent 实例**：在模块级调用一次，拿到 `GsCoreAIAgent` 后反复 `.run(user_message=...)`；支持 Pydantic 结构化输出（`output_type=BaseModel`）。详见 [§5.1](./references/05-create-agent.md)。
 - **`ai_entity` 自动同步 vs `add_manual_knowledge` 手动管理**：前者启动时自动同步到向量库、`_hash` 检测增量更新；后者不自动同步、需手动调向量库 API。详见 [§6.2](./references/06-knowledge-and-alias.md)。
@@ -93,7 +93,7 @@ description: >
 - **MCP 工具 ID 格式**：`{mcp_id} - {tool_name}`，如 `minimax - web_search`；可用 `parse_mcp_tool_id` / `format_mcp_tool_id` 解析与组装。详见 [§11.1](./references/11-mcp-image-search-and-meme.md)。
 - **MCP Server 插件钩子**（`__init__.py` 顶层注册）：`register_mcp_token_verifier`（Bearer → claims，须含 `user_id`）、`register_mcp_event_enricher`（同步补 Event 会话字段）、`register_mcp_export_filter`（启动快照白名单，未注册则导出全部）。详见 [§11.1.7](./references/11-mcp-image-search-and-meme.md#117-mcp-server-插件扩展点)。
 - **Web Search 统一接口**：`web_search()` 按 `websearch_provider`（默认 **AnySearch**，可匿名）+ `websearch_lb_strategy`（默认 **error_switch**）调度 AnySearch / Firecrawl / Tavily / Jina(`s.jina.ai`) / Exa / MCP；**异常或空结果**会按备用链切换；密钥与策略热读、无需重启。详见 [§11.3](./references/11-mcp-image-search-and-meme.md)。
-- **Web Fetch**：`fetch_webpage_as_markdown` / `web_fetch_tool` 默认 **Jina**(`r.jina.ai`，Key 可选) + 备用 **local**；策略字段 `webfetch_*` 与搜索同构；工具外层 `timeout=100`。详见 [§11.3b](./references/11-mcp-image-search-and-meme.md)。
+- **Web Fetch**：`fetch_webpage_as_markdown` / `web_fetch_tool` 默认 **Jina**(`r.jina.ai`，Key 可选)，可选 DeepSeek、Exa Contents、**local**；策略字段 `webfetch_*` 与搜索同构；工具外层 `timeout=100`。详见 [§11.3b](./references/11-mcp-image-search-and-meme.md)。
 - **Meme 表情包集成点**：`handler.py` 中通过 `asyncio.create_task(observe_message_for_memes(event))` 异步采集；`handle_ai.py` 中导入 `meme.startup` 和 `meme_tools` 触发 `@on_core_start` 钩子与 `@ai_tools` 注册。详见 [§11.4](./references/11-mcp-image-search-and-meme.md)。
 - **嵌入 Provider 懒 import 工厂模式**：插件 `__init__.py` 顶层调 `register_embedding_provider` 注册 `EmbeddingProviderEntry`；重依赖（如 `torch` / `sentence_transformers`）只能在 `factory` 内部 import；配置指向的 provider 不可用时框架**自动降级回 local** 并记录 error，不会让 AI 核心整体挂掉。详见 [§12](./references/12-embedding-provider.md)。
 

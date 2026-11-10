@@ -24,6 +24,7 @@ from gsuid_core.ai_core.relationship.signals import (
     REASON_BUDGET,
     REASON_ADMIN_SET,
     REASON_NO_SIGNAL,
+    NegSignal,
     PosSignal,
     TurnSignals,
     scan_signals,
@@ -122,6 +123,9 @@ def plan_delta(
     return raw, primary, hits
 
 
+_DAILY_LOSS_CAP: int = 20
+
+
 def clip_to_budget(
     raw_delta: int,
     *,
@@ -133,7 +137,7 @@ def clip_to_budget(
         remaining = _cfg_int("favor_daily_gain_cap") - daily_gain
         return max(0, min(raw_delta, remaining))
     if raw_delta < 0:
-        remaining = _cfg_int("favor_daily_loss_cap") - daily_loss
+        remaining = _DAILY_LOSS_CAP - daily_loss
         return -max(0, min(-raw_delta, remaining))
     return 0
 
@@ -151,6 +155,7 @@ async def settle_turn(
     is_master: bool = False,
     guard_flags: "GuardFlags | None" = None,
     user_name: str = "",
+    persona_name: str = "",
 ) -> SettleOutcome:
     """回合收尾结算。返回结算结果（含供下一轮使用的 View）。
 
@@ -169,18 +174,21 @@ async def settle_turn(
     )
 
     if not engine_enabled():
-        view = await _read_view(user_id, bot_id, is_master)
+        view = await _read_view(user_id, bot_id, persona_name, is_master)
         return SettleOutcome(0, REASON_NO_SIGNAL, view.score, view.score, view, signals, wrote=False)
 
-    record = await UserFavorability.get_or_create_user_favorability(user_id, bot_id, user_name)
-    score_before = record.favorability
+    existing = await UserFavorability.get_user_favorability(user_id, bot_id, persona_name)
+    score_before = existing.favorability if existing is not None else 0
     now_ts = int(time.time())
     today = _today()
 
     # 换日：清空日预算
-    day_rolled = record.daily_ymd != today
-    daily_gain = 0 if day_rolled else record.daily_gain
-    daily_loss = 0 if day_rolled else record.daily_loss
+    if existing is None or existing.daily_ymd != today:
+        daily_gain = 0
+        daily_loss = 0
+    else:
+        daily_gain = existing.daily_gain
+        daily_loss = existing.daily_loss
 
     # 「当日首次有内容」= 今天还没涨过分。一天一次，不看具体是哪条正信号先命中。
     first_meaningful_today = daily_gain == 0
@@ -188,8 +196,9 @@ async def settle_turn(
     # 会话窗节流：距最近一次正向互动不足窗口且当日已吃满窗口配额 → 普通正信号不再加
     window_seconds = _cfg_int("favor_session_window_minutes") * 60
     session_gain_used = (
-        record.last_positive_interact_at > 0
-        and now_ts - record.last_positive_interact_at < window_seconds
+        existing is not None
+        and existing.last_positive_interact_at > 0
+        and now_ts - existing.last_positive_interact_at < window_seconds
         and daily_gain >= _cfg_int("favor_session_gain_cap")
     )
 
@@ -206,6 +215,12 @@ async def settle_turn(
     if raw_delta != 0 and delta == 0:
         reason = REASON_BUDGET
 
+    # 未打分用户若本轮无分值变化且无负向信号，不落库空 0 分，保持 unscored（打过照面的群友）
+    if existing is None and delta == 0 and not signals.has_negative:
+        logger.debug(t("log.ai.relationship_settle_noop", user=user_id, reason=reason))
+        view = view_from_score(None, is_master)
+        return SettleOutcome(0, reason, 0, 0, view, signals, wrote=False)
+
     new_score = _clamp(score_before + delta)
     applied = new_score - score_before
     # interaction_count 只在有效互动时 +1；管理侧 set 不冒充互动
@@ -215,6 +230,7 @@ async def settle_turn(
     await UserFavorability.apply_settlement(
         user_id,
         bot_id,
+        persona_name,
         new_score=new_score,
         delta=applied,
         reason=reason,
@@ -241,15 +257,27 @@ async def settle_turn(
     else:
         logger.debug(t("log.ai.relationship_settle_noop", user=user_id, reason=reason))
 
-    view = view_from_score(new_score, is_master)
+    view = view_from_score(
+        new_score,
+        is_master,
+        vibe=(existing.interaction_vibe or "") if existing is not None else "",
+        callbacks=tuple(existing.shared_callbacks_list) if existing is not None else (),
+    )
     return SettleOutcome(applied, reason, score_before, new_score, view, signals, wrote=True)
 
 
-async def _read_view(user_id: str, bot_id: str, is_master: bool) -> RelationshipView:
+async def _read_view(user_id: str, bot_id: str, persona_name: str, is_master: bool) -> RelationshipView:
     from gsuid_core.ai_core.database.models import UserFavorability
 
-    record = await UserFavorability.get_user_favorability(user_id, bot_id)
-    return view_from_score(record.favorability if record is not None else None, is_master)
+    record = await UserFavorability.get_user_favorability(user_id, bot_id, persona_name)
+    if record is None:
+        return view_from_score(None, is_master)
+    return view_from_score(
+        record.favorability,
+        is_master,
+        vibe=record.interaction_vibe or "",
+        callbacks=tuple(record.shared_callbacks_list),
+    )
 
 
 async def apply_model_delta(
@@ -258,15 +286,16 @@ async def apply_model_delta(
     bot_id: str,
     delta: int,
     user_name: str = "",
+    persona_name: str = "",
 ) -> SettleOutcome:
     """内部增量（吃与框架结算同一份日预算）。模型侧增量工具已删除，勿再接回工具表。"""
     from gsuid_core.ai_core.database.models import UserFavorability
 
     if not engine_enabled() or delta == 0:
-        view = await _read_view(user_id, bot_id, False)
+        view = await _read_view(user_id, bot_id, persona_name, False)
         return SettleOutcome(0, REASON_NO_SIGNAL, view.score, view.score, view, None, wrote=False)
 
-    record = await UserFavorability.get_or_create_user_favorability(user_id, bot_id, user_name)
+    record = await UserFavorability.get_or_create_user_favorability(user_id, bot_id, persona_name, user_name)
     before = record.favorability
     now_ts = int(time.time())
     today = _today()
@@ -281,6 +310,7 @@ async def apply_model_delta(
     await UserFavorability.apply_settlement(
         user_id,
         bot_id,
+        persona_name,
         new_score=new_score,
         delta=applied,
         reason=reason,
@@ -293,7 +323,20 @@ async def apply_model_delta(
         user_name=user_name,
     )
     logger.info(t("log.ai.relationship_model_delta", user=user_id, delta=applied, score=new_score))
-    return SettleOutcome(applied, reason, before, new_score, view_from_score(new_score, False), None, wrote=True)
+    return SettleOutcome(
+        applied,
+        reason,
+        before,
+        new_score,
+        view_from_score(
+            new_score,
+            False,
+            vibe=record.interaction_vibe or "",
+            callbacks=tuple(record.shared_callbacks_list),
+        ),
+        None,
+        wrote=True,
+    )
 
 
 async def apply_admin_set(
@@ -303,6 +346,7 @@ async def apply_admin_set(
     value: int,
     user_name: str = "",
     is_master_target: bool = False,
+    persona_name: str = "",
 ) -> SettleOutcome:
     """管理侧绝对值覆盖（``set_user_favorability`` 工具，仅主人可调）。
 
@@ -311,13 +355,14 @@ async def apply_admin_set(
     """
     from gsuid_core.ai_core.database.models import UserFavorability
 
-    record = await UserFavorability.get_or_create_user_favorability(user_id, bot_id, user_name)
+    record = await UserFavorability.get_or_create_user_favorability(user_id, bot_id, persona_name, user_name)
     before = record.favorability
     new_score = _clamp(value)
     now_ts = int(time.time())
     await UserFavorability.apply_settlement(
         user_id,
         bot_id,
+        persona_name,
         new_score=new_score,
         delta=new_score - before,
         reason=REASON_ADMIN_SET,
@@ -335,7 +380,104 @@ async def apply_admin_set(
         REASON_ADMIN_SET,
         before,
         new_score,
-        view_from_score(new_score, is_master_target),
+        view_from_score(
+            new_score,
+            is_master_target,
+            vibe=record.interaction_vibe or "",
+            callbacks=tuple(record.shared_callbacks_list),
+        ),
         None,
+        wrote=True,
+    )
+
+
+async def settle_semantic(
+    *,
+    user_id: str,
+    bot_id: str,
+    persona_name: str,
+    signal: NegSignal,
+    evidence: str,
+    user_name: str = "",
+) -> SettleOutcome:
+    """语义负信号异步结算（复用抽取调用产出，零额外 LLM 请求）。
+
+    规则：
+    - 主人（masters）不扣分；
+    - 走与 settle_turn 相同的 clip_to_budget 和 apply_settlement；
+    - 仅负信号扣分，teasing/friendly/neutral 不加分；
+    - evidence 记入 last_reason。
+    """
+    from gsuid_core.config import core_config
+    from gsuid_core.ai_core.database.models import UserFavorability
+
+    clean_uid = user_id.strip()
+    clean_bot = bot_id.strip()
+    clean_persona = persona_name.strip()
+    if not clean_uid or not clean_bot or not clean_persona or not engine_enabled():
+        view = await _read_view(clean_uid, clean_bot, clean_persona, False)
+        return SettleOutcome(0, REASON_NO_SIGNAL, view.score, view.score, view, None, wrote=False)
+
+    raw_masters = core_config.get_config("masters")
+    masters = (
+        {str(m).strip() for m in raw_masters if isinstance(m, (str, int)) and not isinstance(m, bool)}
+        if isinstance(raw_masters, list)
+        else set()
+    )
+    is_master = clean_uid in masters
+    if is_master:
+        view = await _read_view(clean_uid, clean_bot, clean_persona, True)
+        return SettleOutcome(0, "master_exempt", view.score, view.score, view, None, wrote=False)
+
+    if signal not in (NegSignal.PROVOKE, NegSignal.HOSTILE):
+        view = await _read_view(clean_uid, clean_bot, clean_persona, False)
+        return SettleOutcome(0, REASON_NO_SIGNAL, view.score, view.score, view, None, wrote=False)
+
+    raw_delta = NEG_WEIGHTS[signal]
+
+    existing = await UserFavorability.get_or_create_user_favorability(clean_uid, clean_bot, clean_persona, user_name)
+    score_before = existing.favorability
+    now_ts = int(time.time())
+    today = _today()
+    day_rolled = existing.daily_ymd != today
+    daily_gain = 0 if day_rolled else existing.daily_gain
+    daily_loss = 0 if day_rolled else existing.daily_loss
+
+    delta = clip_to_budget(raw_delta, daily_gain=daily_gain, daily_loss=daily_loss)
+    if delta == 0:
+        view = view_from_score(score_before, is_master=False)
+        return SettleOutcome(0, REASON_BUDGET, score_before, score_before, view, None, wrote=False)
+
+    new_score = score_before + delta
+    reason_str = f"{signal.value}:{evidence[:60]}" if evidence else signal.value
+    await UserFavorability.apply_settlement(
+        clean_uid,
+        clean_bot,
+        clean_persona,
+        new_score=new_score,
+        delta=delta,
+        reason=reason_str,
+        now_ts=now_ts,
+        daily_ymd=today,
+        daily_gain=daily_gain,
+        daily_loss=daily_loss + abs(delta),
+        bump_interaction=False,
+        refresh_positive=False,
+        user_name=user_name,
+    )
+
+    view_after = view_from_score(
+        new_score,
+        is_master=False,
+        vibe=(existing.interaction_vibe or "") if existing is not None else "",
+        callbacks=tuple(existing.shared_callbacks_list) if existing is not None else (),
+    )
+    return SettleOutcome(
+        delta=delta,
+        reason=signal.value,
+        score_before=score_before,
+        score_after=new_score,
+        view=view_after,
+        signals=None,
         wrote=True,
     )

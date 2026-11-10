@@ -6,7 +6,7 @@
 - ``register_kanban_task``        ：注册任务树（强校验最近一次评估 covered=true）
 - ``respawn_subtask``             ：复活 failed 子任务（最多 N 次后强制审批）
 - ``fail_task_tree``              ：明确终结整树
-- 子任务审批转达已统一到 ``respond_approval``（buildin_tools/approval_tools.py）
+- 子任务审批只认私聊确认码或审批中心，模型不转达
 - ``artifact_put`` / ``artifact_get`` / ``artifact_list``：Artifact Hub 工具
 - ``artifact_get_recent``         ：取根任务最近一份 artifact 原文（追问溯源）
 
@@ -744,8 +744,8 @@ async def respawn_subtask(
         new_params: 修正后的参数（覆盖 params_override）。
         new_agent_profile: 改派给其它 profile（必须已注册）。
 
-    超过 3 次重派会强制转 waiting_approval，请改用 webconsole 走主人审批，
-    或让主人在对话中明示同意 / 拒绝后调用 respond_approval。
+    超过 3 次重派会强制转 waiting_approval。主人用私聊确认码或审批中心批准。
+    群里说「同意」不会通过。
     """
     ev = ctx.deps.ev
     if ev is None:
@@ -813,8 +813,7 @@ async def fail_task_tree(ctx: RunContext[ToolContext], task_ref_text: str, reaso
     return f"✅ 已终结整树【任务#{root.ordinal}｜{root.display_name}】：{reason}"
 
 
-# 子任务审批的转达已统一到 buildin_tools/approval_tools.py::respond_approval
-# （统一审批中心 kanban_subtask 领域），本模块不再注册专用转达工具。
+# 子任务审批由审批中心裁决（私聊确认码或控制台），本模块不注册转达工具。
 
 
 # Artifact Hub 工具
@@ -828,10 +827,12 @@ async def artifact_put(
     mime: str = "",
     artifact_kind: str = "output",
     file_path: str = "",
+    title: str = "",
+    body: str = "",
 ) -> str:
-    """写入一个产出 artifact（仅在 Kanban / ad-hoc 任务执行上下文中有效）。
+    """写入一个产出 artifact（支持 Kanban 任务节点及任意对话/自主行动上下文）。
 
-    自动绑定当前 root_task_id / task_id；返回 res 句柄供下游引用。
+    自动绑定当前 root_task_id / task_id（无 Kanban 任务时自动归入 ad-hoc 工作区）；返回 res 句柄供下游引用。
 
     **三种登记模式（必须三选一，不要混用）**：
 
@@ -839,8 +840,9 @@ async def artifact_put(
        传 ``file_path``（相对路径默认相对 workspace，也可以传 workspace 内绝对
        路径）。框架**直接登记 workspace 内的原文件路径**（不再复制副本，所有
        中间代码 + 最终产物都在同一个 workspace 文件夹里方便用户查看），并按后缀
-       自动推断 mime，主人格之后可以直接 `send_message_by_ai(image_id="res_xxx")`
-       把这张图 / 这份文件原样发给主人。文件必须在 workspace 内，越界路径会被拒绝。
+       自动推断 mime，主人格之后可以直接 `send_message_by_ai` 把这张图 / 这份文件
+       原样发给主人（图片用 `image_ids="res_xxx"`，文件用 `file_ids="res_xxx"`，
+       单文件 ≤10MB）。文件必须在 workspace 内，越界路径会被拒绝。
        ✅ 正确：`artifact_put(file_path="love_heart.png", summary="渐变彩色爱心")`
        ❌ 错误：`artifact_put(payload='{"file": "x.png", "size": 17842}')` ← 这只是
           一段 JSON 元数据，**不是图片**；主人格 `send_message_by_ai` 时拿到的不是
@@ -861,9 +863,28 @@ async def artifact_put(
         file_path: 模式 1 使用——workspace 内的相对路径或绝对路径，指向实际落盘的
             产物文件。文件必须存在，否则返回失败。
     """
+    if not payload and body:
+        payload = body
+    if not summary and title:
+        summary = title
+
     plan_ctx = get_plan_context()
+    has_kanban_task = plan_ctx is not None and bool(plan_ctx.root_task_id)
     if plan_ctx is None or not plan_ctx.root_task_id:
-        return "ℹ️ 当前不在 Kanban 任务上下文中，artifact_put 不可用。"
+        from gsuid_core.ai_core.memory.scope import scope_key_for_conversation
+
+        ev = ctx.deps.ev
+        owner_id = str(ev.user_id) if ev is not None and ev.user_id else ""
+        scope_k = scope_key_for_conversation(ev.group_id, owner_id) if ev is not None else ""
+        sess_id = ctx.deps.parent_session_id or (ev.session_id if ev is not None and ev.session_id else "")
+        raw_seg = (sess_id or owner_id or "adhoc").replace(":", "_").replace("/", "_")[:48]
+        plan_ctx = PlanRunContext(
+            task_id=raw_seg or "adhoc",
+            root_task_id="adhoc",
+            agent_profile="adhoc",
+            owner_user_id=owner_id,
+            scope_key=scope_k,
+        )
 
     file_path_obj = None
     if file_path:
@@ -884,16 +905,19 @@ async def artifact_put(
     )
     if art is None:
         if file_path_obj is not None:
+            if file_path_obj.exists():
+                return f"⚠️ 登记 artifact 失败：文件 `{file_path}` 超出允许的沙盒工作区，且不属于受信任的产物输出目录。"
             return (
                 f"⚠️ 登记 artifact 失败：找不到文件 `{file_path}`（相对路径默认相对"
                 f" workspace）。请先确认 `list_directory` 能看到这个文件再登记。"
             )
         return "⚠️ 登记 artifact 失败（payload 与 file_path 均为空？）。"
-    # 同步更新当前任务的 output_artifact_id（最近一次产出）
-    await AIAgentTask.update_data_by_data(
-        select_data={"id": plan_ctx.task_id},
-        update_data={"output_artifact_id": art.id},
-    )
+    # 同步更新当前任务的 output_artifact_id（仅当处于真实 Kanban 任务中时）
+    if has_kanban_task:
+        await AIAgentTask.update_data_by_data(
+            select_data={"id": plan_ctx.task_id},
+            update_data={"output_artifact_id": art.id},
+        )
     binary_hint = ""
     if art.payload_path and art.mime and art.mime.startswith("image/"):
         binary_hint = "（真实图片文件，主人格可 send_message_by_ai 直发）"
@@ -1029,10 +1053,23 @@ async def _artifact_access_allowed(
         source = await AIAgentTask.get_by_id(art.root_task_id)
         if source is None or not source.owner_user_id:
             return True
-        return str(ev.user_id) == str(source.owner_user_id)
+        if ev.user_id and str(ev.user_id) == str(source.owner_user_id):
+            return True
+        from gsuid_core.ai_core.utils import _is_master_user
 
-    # —— 同树 ——
-    if art.root_task_id == plan_ctx.root_task_id:
+        if ev.user_id and (_is_master_user(str(ev.user_id)) or (ev.user_pm is not None and ev.user_pm <= 1)):
+            return True
+        if ev.group_id:
+            if source.group_id and str(ev.group_id) == str(source.group_id):
+                return True
+            if source.scope_key and str(ev.group_id) in source.scope_key:
+                return True
+        if ev.session_id and source.session_id and ev.session_id == source.session_id:
+            return True
+        return False
+
+    # —— 同树或独立 ad-hoc 产物 ——
+    if art.root_task_id == plan_ctx.root_task_id or art.root_task_id == "adhoc":
         return True
 
     current = await AIAgentTask.get_by_id(plan_ctx.task_id)

@@ -95,16 +95,19 @@ async def list_memory_conflicts(
     limit: int = Query(100, le=500),
     _user: Dict[str, Any] = Depends(require_auth),
 ) -> Dict[str, Any]:
-    """列出某 scope 的记忆矛盾记录（C11 Contradiction）。"""
-    from gsuid_core.ai_core.memory.database.models import AIMemConflict
+    """列出某 scope 的四态冲突/待证边（schema_v2 收口到 AIMemEdge）。"""
+    from gsuid_core.ai_core.memory.database.models import AIMemEdge
 
     async with async_maker() as session:
         rows = list(
             (
                 await session.execute(
-                    select(AIMemConflict)
-                    .where(AIMemConflict.scope_key == scope_key)
-                    .order_by(col(AIMemConflict.created_at).desc())
+                    select(AIMemEdge)
+                    .where(
+                        AIMemEdge.scope_key == scope_key,
+                        col(AIMemEdge.resolution_state).in_(["contradicted", "staging"]),
+                    )
+                    .order_by(col(AIMemEdge.created_at).desc())
                     .limit(limit)
                 )
             )
@@ -114,12 +117,12 @@ async def list_memory_conflicts(
     return _ok(
         [
             {
-                "id": c.id,
-                "fact_signature": c.fact_signature,
-                "summary": c.summary,
-                "created_at": c.created_at.isoformat() if c.created_at else None,
+                "id": e.id,
+                "fact_signature": f"{e.source_entity_id}|{e.target_entity_id}|{e.slot_key}",
+                "summary": e.fact,
+                "created_at": e.created_at.isoformat() if e.created_at else None,
             }
-            for c in rows
+            for e in rows
         ]
     )
 
@@ -249,12 +252,14 @@ async def abort_agent_task(
 @app.get("/api/agent_debug/self_model", summary="获取自我模型", tags=AGENT_DEBUG)
 async def get_self_model_api(
     bot_id: str = Query("default"),
+    persona_name: str = Query(""),
     _user: Dict[str, Any] = Depends(require_auth),
 ) -> Dict[str, Any]:
     """查看 self_model 演化层（承诺 / 偏好 / 反思）。"""
     from gsuid_core.ai_core.self_cognition import get_self_model
+    from gsuid_core.ai_core.migrations.persona_scope_v1 import get_legacy_owner_persona
 
-    model = await get_self_model(bot_id)
+    model = await get_self_model(bot_id, persona_name or get_legacy_owner_persona())
     return _ok(model)
 
 
@@ -262,6 +267,7 @@ class SelfModelEditRequest(BaseModel):
     bot_id: str = "default"
     field: str
     items: List[str]
+    persona_name: str = ""
 
 
 @app.post("/api/agent_debug/self_model", summary="设置自我模型", tags=AGENT_DEBUG)
@@ -274,5 +280,9 @@ async def set_self_model_api(
 
     if body.field not in _FIELDS:
         return _err(f"非法字段，须为 {_FIELDS} 之一")
-    await overwrite_self_model_field(body.bot_id, body.field, body.items)
+    from gsuid_core.ai_core.migrations.persona_scope_v1 import get_legacy_owner_persona
+
+    await overwrite_self_model_field(
+        body.bot_id, body.persona_name or get_legacy_owner_persona(), body.field, body.items
+    )
     return _ok({"field": body.field, "count": len(body.items)})

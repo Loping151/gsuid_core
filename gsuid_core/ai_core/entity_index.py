@@ -31,8 +31,10 @@ from gsuid_core.logger import logger
 # CJK surface 至少 2 字、ASCII surface 至少 3 字才允许入索引（见模块 docstring）。
 _MIN_CJK_LEN: int = 2
 _MIN_ASCII_LEN: int = 3
-# 当前句或最近对白的唯一插件。find_tools 按它丢掉别的插件。
+# 当前句或最近对白指向的唯一插件。是否硬锁看 ALIAS_PLUGIN_EXPLICIT_EXTRA_KEY。
 ALIAS_PLUGIN_EXTRA_KEY = "alias_context_plugin"
+# 锁的来源：True=当前句点名（丢别家插件）；False=背景猜测（软锁，只补不丢）。
+ALIAS_PLUGIN_EXPLICIT_EXTRA_KEY = "alias_context_plugin_explicit"
 # 锁定时的用户原话。深召回用它，不用模型改写后的 need。
 ALIAS_ROUTE_TEXT_KEY = "alias_route_text"
 
@@ -215,12 +217,17 @@ def format_alias_bindings(text: str, *, limit: int = 6) -> str:
             parts.append(f"{surface}→{plugin}")
     if not parts:
         return ""
-    body = "；".join(parts)
-    return (
-        "（系统：别名表命中，归属只认下表，禁止改判成别的插件："
-        + body
-        + "。问这些专名只查上表插件；find_tools 的 need 禁止改写成别的插件。）"
-    )
+    from gsuid_core.ai_core.control.lines import alias_binding_line
+
+    return alias_binding_line("；".join(parts))
+
+
+@dataclass(frozen=True)
+class PluginLock:
+    """插件锁：plugin 非空才生效；explicit=True 表示当前句点名（硬锁）。"""
+
+    plugin: str
+    explicit: bool
 
 
 def sole_background_plugin(current: str, background: str) -> str:
@@ -233,14 +240,14 @@ def sole_background_plugin(current: str, background: str) -> str:
     return ""
 
 
-def lock_plugin(current: str, background: str) -> str:
-    """当前句恰好一个插件就用它；否则才继承最近对白里的唯一插件。"""
+def lock_plugin(current: str, background: str) -> PluginLock:
+    """当前句恰好一个插件则硬锁；否则继承最近对白里的唯一插件作软锁。"""
     found = plugins_in_text(current)
     if len(found) == 1:
-        return found[0]
+        return PluginLock(found[0], True)
     if found:
-        return ""
-    return sole_background_plugin(current, background)
+        return PluginLock("", False)
+    return PluginLock(sole_background_plugin(current, background), False)
 
 
 def plugins_in_text(text: str) -> List[str]:

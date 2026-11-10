@@ -156,8 +156,12 @@ result = await client.call_tool("search", {"query": "RAG"})
 **使用示例:**
 ```python
 from gsuid_core.ai_core.mcp.utils import (
-    is_mcp_provider, get_mcp_tool_id, build_mcp_arguments,
-    call_mcp_tool_checked, save_binary_to_tempfile, cleanup_tempfile,
+    is_mcp_provider,
+    get_mcp_tool_id,
+    build_mcp_arguments,
+    call_mcp_tool_checked,
+    save_binary_to_tempfile,
+    cleanup_tempfile,
 )
 
 # ASR 模块重构前:
@@ -173,8 +177,10 @@ if provider == "MCP":
         return result.text
     finally:
         if os.path.exists(audio_path):
-            try: os.unlink(audio_path)
-            except Exception as e: logger.warning(...)
+            try:
+                os.unlink(audio_path)
+            except Exception as e:
+                logger.warning(...)
 
 # ASR 模块重构后:
 if is_mcp_provider(provider):
@@ -305,16 +311,27 @@ if is_mcp_provider(provider):
 - **`stdio`**：进程 stdin/stdout（本地子进程）。
 - 旧配置 `sse` 视为 `http`。
 
-**HTTP 健壮性（`McpHttpGuard`）:**
-- 挂载点外包一层护栏：子应用跑在 `anyio.CancelScope(shield=True)` 内；HTTP `send`
-  失败（客户端断开）不回灌 SDK
-- 子应用未写 `http.response.start` 就返回，或抛 `ClosedResourceError` /
-  `ExceptionGroup` 时：护栏回 **503 + JSON-RPC error**（已写 start 则不再写 503），
-  并重建 HTTP 子应用与 `StreamableHTTPSessionManager`（冷却 5s；建失败则保留旧挂载）
-- 线上形态（2026-09-18）：`writer.send` → `ClosedResourceError` → SDK 记
-  `SSE response error` 后吞掉、不写响应 → Starlette `No response returned.` →
-  `POST /api/mcp/` 永久 500。`stateless_http` 把每请求任务 spawn 进终身 task group，
-  毒化后不会自愈，必须换 lifespan 拿新的 session manager
+**HTTP 健壮性（`McpHttpGuard` 与常驻生命周期任务）:**
+- 挂载点是 `McpHttpGuard`，内层应用由常驻任务持有。子应用跑在
+  `anyio.CancelScope(shield=True)` 内。HTTP `send` 失败（客户端断开）不回灌 SDK，
+  本次请求不重放。子应用正常返回时不重建会话
+- 每一代 lifespan 由同一个常驻任务进入和退出。重建不更换挂载点。关闭时先停这个任务，
+  再拿重建锁并卸挂载。该任务使用空的 `contextvars.Context()`，不继承当前请求的上下文
+- 状态码还没写给客户端时（没写 start，或 start 仍被护栏扣住），子应用就返回或抛错：
+  护栏让常驻任务重建会话，并把同一次请求直接交给新的内层应用。重放写出完整响应时，
+  客户端只看到这次结果。重放仍没有完整响应时回 **503 + JSON-RPC error**。冷却 5 秒。
+  `http_app()` 失败时旧会话仍在。新会话进入失败时，旧会话已由同一任务退出，挂载还在，
+  本次回 503
+- 正文已经写给客户端、但没有 `more_body=false` 就返回时：状态码不能改。护栏补一个空结束块并重建，本次不重放
+- 线上形态：`stateless_http` 把每请求任务 spawn 进终身 task group。任一子任务以
+  非 `CancelledError` 退出时，anyio 取消这个 group。若进入 lifespan 的任务已经返回，
+  取消到不了那个任务，lifespan 就停在 `yield`，group 保持 entered。之后 `start()`
+  仍能成功；`started()` 把新任务挂进已取消的 scope，下一检查点就被取消，`connect()`
+  关掉读流。`writer.send` → `BrokenResourceError` → SDK 记 `SSE response error` 后吞掉，
+  常常已写 start。外层 `BaseHTTPMiddleware` 等不到结束块，抛 `No response returned.`，
+  访问日志为 `POST /api/mcp/` 500。2026-10-20 的日志里该状态从 00:00 持续到 08:22。
+  常驻任务停在 lifespan 里。scope 取消会打到它；它清掉取消计数并退出这一代，
+  同一次重建由这个任务进入新会话。状态码还没写给客户端的请求会重放
 
 **鉴权（框架零插件依赖；方向永远是插件 → 框架）:**
 - `Authorization: Bearer <token>`
@@ -323,6 +340,9 @@ if is_mcp_provider(provider):
 - **key 或校验器任一存在即强制鉴权**；均不存在时为开发用开放模式
 - claims 须含 ``user_id``；缺 ``user_pm`` 时按最低权限 ``6`` 写入 Event
 - 静态 key 成功时服务身份 ``user_pm=0``
+- `api_key` / 开放模式下可委托调用方 ``user_id``（见文末「外部客户端 → 框架 MCP Server」）；
+  插件校验器 claims 中的 ``auth`` 是保留字段，取值 ``api_key``/``none``/``anonymous``
+  会启用委托语义，不要占用
 
 **配置项（`MCP_SERVER_CONFIG` → `data/ai_core/mcp_server_config.json`）:**
 - `enable_mcp_server` — 默认 False
@@ -397,7 +417,30 @@ http_headers = { Authorization = "Bearer <token>" }
 ```
 
 用户态身份（JWT 等）由**插件**通过 `register_mcp_token_verifier` 注入；
-可选会话头：`X-MCP-Group-Id` / `X-MCP-Bot-Id`（写入 Event，无业务语义）。
+可选会话头：`X-MCP-Group-Id` / `X-MCP-Bot-Id` / `X-MCP-User-Id`（写入 Event，无业务语义）。
+
+**调用方 `user_id` 委托（共享连接报谁在说）:**
+
+共享身份凭证（静态 `api_key`、开放模式）下一条连接被多人共用，
+框架按以下顺序确定 `Event.user_id`：
+
+```
+工具参数 user_id > X-MCP-User-Id 请求头 > token 自身 claims
+```
+
+- `X-MCP-User-Id` 只应由**可信网关**（Bot 适配器）断言，**不能转发终端用户自报的值**：
+  网关断言的 user_id 会查 `config.json` 的 `masters` / `superusers`，映射 `0 / 1 / 6` 权限
+- 工具参数 `user_id` 由外部大模型填写、可被提示词诱导，与请求头不一致时固定 `user_pm=6`，不查表
+- 插件专属 token（`plugin` 模式）始终锁定 claims 中的 `user_id`，两个通道都不生效
+- 开放模式无鉴权：任何能访问端点的客户端都可自称任意 `user_id` 读取 `pm<=6` 的用户数据，
+  不要把 `/api/mcp` 直接暴露给不可信网络
+
+**工具侧 opt-in（docstring 声明）:**
+
+只有工具 docstring（或 `to_ai` 桥接的触发器文档）的 `Args:` 块里写了 `user_id:` 一行，
+MCP 导出 Schema 才会注入可选 `user_id` 参数；该行的文字即参数描述。
+调用前框架把它从参数中弹出写入 `ev.user_id`，不透传给插件函数。
+函数签名本身带 `user_id` 形参的工具视为查询目标参数，原样透传，不当作调用者身份。
 
 ## 扩展指南
 

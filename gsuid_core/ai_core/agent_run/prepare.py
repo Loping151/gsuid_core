@@ -11,10 +11,7 @@ from pydantic_ai.usage import UsageLimits
 
 from gsuid_core.i18n import t as i18n_t
 from gsuid_core.logger import logger
-from gsuid_core.ai_core import (
-    wall_clock,
-    interaction_scaffold,
-)
+from gsuid_core.ai_core import interaction_scaffold
 from gsuid_core.ai_core.const import (
     _PROGRESSIVE_TOOLS_SKIP_INTENTS,
 )
@@ -23,7 +20,9 @@ from gsuid_core.ai_core.utils import (
     notify_master_of_budget_block,
 )
 from gsuid_core.ai_core.models import ToolContext
+from gsuid_core.ai_core.control.lines import UNMET_TOOL_REMINDER
 from gsuid_core.ai_core.agent_run.host import RunOnceHost
+from gsuid_core.ai_core.persona.config import ASIDE_MODE
 from gsuid_core.ai_core.agent_run.state import (
     BUDGET_GATE_PASS,
     RunOnceState,
@@ -33,12 +32,13 @@ from gsuid_core.ai_core.agent_run.support import (
     _STATUS_INQUIRY_HINT,
     _INTERACTIVE_CREATE_BY,
     _append_user_text,
-    _ensure_inner_os_on_first_user,
     _capability_exclusive_tool_names,
+    _ensure_session_anchor_on_first_user,
 )
 from gsuid_core.ai_core.configs.ai_config import ai_config
 from gsuid_core.ai_core.control.directive import DISPUTE_EXTRA_KEY, is_control_envelope
 from gsuid_core.ai_core.agent_run.budget_ctx import _current_budget_scope
+from gsuid_core.ai_core.agent_run.request_limit import request_limit_for
 from gsuid_core.ai_core.agent_run.speech_policy import (
     spoken_user_body_len,
     resolve_speech_policy,
@@ -118,9 +118,9 @@ class PreparePhase(RunOnceHost):
         self._last_attempt_delegated_render = False
         self._last_attempt_image_sent = False
         self._last_attempt_pending_async = False
+        self._last_attempt_effectual_mutate = False
         self._last_attempt_has_status_tool = False
         self._last_attempt_thinking = ""
-        st.wall_nudged = False  # C-4 墙钟软预算：每 run 至多注入一次收敛提示
         # 出戏防火墙拦下的文本段（§D.4）：iter 结束后走"提醒→重说→放行"闭环
         st.ooc_blocked = []
         # 输出闸门：待注入 REWRITE feedback（同 response 可多段合并）；熔断后本轮静默
@@ -132,7 +132,7 @@ class PreparePhase(RunOnceHost):
         st.saw_structured_return = False
         # 本轮是否已委派 render_agent（勿把 research 的 create_subagent 当成已出图）
         st.delegated_render = False
-        # 同工具空转计数：连续同名工具调用次数；达阈值后注入 thrash fuse（每 run 一次）
+        # 同一调用（工具名 + 参数）连续次数；达阈值后注入 thrash fuse（每 run 一次）
         st.same_tool_streak = 0
         st.same_tool_name = ""
         st.thrash_fused = False
@@ -156,18 +156,11 @@ class PreparePhase(RunOnceHost):
         st.in_flight_short = False
         st.render_ack_seen = False
 
-        # 使用自定义迭代次数限制（如果有），否则使用配置默认值。
-        if self.max_iterations is not None:
-            st.limits = UsageLimits(request_limit=self.max_iterations)
-        else:
-            multi_agent_lenth: int = ai_config.get_config("multi_agent_lenth").data
-            st.limits = UsageLimits(request_limit=multi_agent_lenth)
+        # 思考轮只看 create_by。max_iterations 参数不再改这一限。
+        st.limits = UsageLimits(request_limit=request_limit_for(self.create_by))
 
         # 记录开始时间用于延迟统计
         st.start_time = time.time()
-        # C-4 墙钟时钟：ask_user 等"挂起等人"的时段记进 excluded，判定预算时扣除。
-        # token 在 finally 还原，否则嵌套 run（图片理解/subagent）会顶掉本 run 的时钟。
-        st.wall_acc, st.wall_clock_token = wall_clock.install_clock()
 
         logger.info(i18n_t("log.agent.run_start_started"))
         # st.turn_id：本轮 Agent Run 的唯一标识（= agent_run_id），写入 ToolContext.extra
@@ -185,7 +178,9 @@ class PreparePhase(RunOnceHost):
             _inherited_ut = get_user_turn_id()
             st.user_turn_id = _inherited_ut or ""
         # 交互主人格：专属工具从静态池剥离后，同步写入 blocked，堵住 find_tools 回灌
-        st.blocked_exclusive = _capability_exclusive_tool_names() if self.create_by in _INTERACTIVE_CREATE_BY else set()
+        st.blocked_exclusive = (
+            _capability_exclusive_tool_names() if self.create_by in ("Chat", "Agent", "TEST") else set()
+        )
         # 出站权限控制：交互主人格与 Kanban_Relay 允许出站，能力代理产物回传上游。
         # TEST 本地评测端点作为交互主人格放行出站。
         st.allow_outbound = self.create_by == "Kanban_Relay" or (
@@ -197,6 +192,8 @@ class PreparePhase(RunOnceHost):
             "turn_id": st.turn_id,
             "agent_run_id": st.turn_id,
             "run_sent_texts": self._run_sent_texts,
+            "read_image_ids": self.read_image_ids,
+            "disable_direct_image_injection": self._disable_direct_image_in_run,
             # 同引用透传：纠正轮里 dispute_directive 的申辩要能被外层 settle 读到
             DISPUTE_EXTRA_KEY: self._run_disputes,
             "speech_policy": "free",
@@ -204,6 +201,21 @@ class PreparePhase(RunOnceHost):
             "parent_create_by": self.create_by,
             MODEL_DECLARES_VIDEO_KEY: self._model_declares_video(),
         }
+        # 记录原始用户问题，供话术策略与后续总结共用
+        st.last_user_question = ""
+        if isinstance(st.user_message, str):
+            st.last_user_question = st.user_message.strip()
+        elif isinstance(st.user_message, Sequence):
+            st.last_user_question = "\n".join(item for item in st.user_message if isinstance(item, str)).strip()
+        if st.ev is not None and not (st.ev.image_id_list or st.ev.image_id):
+            if "待读图片ID:" in st.last_user_question:
+                st.run_extra["pending_unread_images"] = True
+            else:
+                from gsuid_core.ai_core.turn_pipeline import extract_pending_unread_images
+
+                _pending = extract_pending_unread_images(st.ev, self.read_image_ids)
+                if _pending:
+                    st.run_extra["pending_unread_images"] = _pending
         if self.persona_name:
             st.run_extra["persona_name"] = self.persona_name
         if st.user_turn_id:
@@ -220,9 +232,7 @@ class PreparePhase(RunOnceHost):
         if st.fw_msg and st.ev is not None and st.ev.user_id:
             st.run_extra["at_user_id"] = str(st.ev.user_id)
         # 话术策略：框架轮 / 进度追问 / 普通（详见 speech_policy）
-        _probe_for_policy = ""
-        if isinstance(st.user_message, str):
-            _probe_for_policy = st.user_message
+        _probe_for_policy = st.user_message if isinstance(st.user_message, str) else st.last_user_question
         st.status_inquiry = (not st.fw_msg) and looks_like_status_inquiry(
             _probe_for_policy,
             has_active_task=st.has_active_task,
@@ -234,12 +244,18 @@ class PreparePhase(RunOnceHost):
             has_active_task=st.has_active_task,
             user_text=_probe_for_policy,
         )
+        st.run_extra["speech_policy"] = st.speech_policy
         # 只锁框架回灌。真人消息里出现这四个字不算交付轮。
         if st.speech_policy == "framework_deliver" or (st.fw_msg and "交付回灌" in _probe_for_policy):
+            from gsuid_core.ai_core.outbound import remember_outbound_topic
+
             st.run_extra["delivery_wake"] = True
+            remember_outbound_topic(st.run_extra, _probe_for_policy)
             if "主图：`" in _probe_for_policy:
                 st.run_extra["delivery_has_image"] = True
         st.in_flight_short = (not st.fw_msg) and st.has_active_task and spoken_user_body_len(_probe_for_policy) <= 48
+        if self.route_decision is not None:
+            st.run_extra["memory_intent"] = self.route_decision.memory_intent
         st.context = ToolContext(
             bot=st.bot,
             ev=st.ev,
@@ -253,13 +269,6 @@ class PreparePhase(RunOnceHost):
 
     async def _run_once_prepare_user_message(self, st: RunOnceState) -> None:
         """用户消息外壳 / RAG / DS / 无工具提醒 / 脚手架 hints / session log。"""
-        # 记录原始用户问题，供后续强制总结使用
-        st.last_user_question = ""
-        if isinstance(st.user_message, str):
-            st.last_user_question = st.user_message.strip()
-        elif isinstance(st.user_message, Sequence):
-            # 从 Sequence[UserContent] 中提取纯文本
-            st.last_user_question = "\n".join(item for item in st.user_message if isinstance(item, str)).strip()
         from gsuid_core.ai_core.utils import mention_names_in_text
 
         st.run_extra["mention_names"] = mention_names_in_text(st.last_user_question)
@@ -292,7 +301,7 @@ class PreparePhase(RunOnceHost):
         st.followup_detected = False
         st.tg = st.turn_graph
         st.cheap = st.cheap_gate
-        if self.create_by in _INTERACTIVE_CREATE_BY and not st.fw_msg:
+        if self.create_by in _INTERACTIVE_CREATE_BY and not st.fw_msg and st.stats_chat_type != ASIDE_MODE:
             _cur_text = st.last_user_question
             _probe = st.ev.raw_text if st.ev is not None and st.ev.raw_text else st.last_user_question
             _is_tome = bool(st.ev.is_tome) if st.ev is not None else False
@@ -304,6 +313,11 @@ class PreparePhase(RunOnceHost):
                 if st.ev is not None:
                     _ut = str(st.ev.user_type or ("group" if st.ev.group_id else "direct"))
                 _has_reply = bool(st.ev.reply or st.ev.reply_id) if st.ev is not None else False
+                from gsuid_core.ai_core.outbound import inspect_quote_relation
+
+                is_rep_bot, is_bystander_q, is_stale_q = (
+                    inspect_quote_relation(st.ev) if st.ev is not None else (None, False, False)
+                )
                 st.tg = interaction_scaffold.build_turn_graph(
                     _probe or _cur_text,
                     persona_name=self.persona_name or "",
@@ -315,6 +329,10 @@ class PreparePhase(RunOnceHost):
                     followup_max_len=int(ai_config.get_config("scaffold_followup_max_len").data),
                     ambient_max_len=int(ai_config.get_config("scaffold_ambient_max_len").data),
                     has_reply=_has_reply,
+                    at_bot=bool(st.ev.at_bot) if st.ev is not None else False,
+                    is_reply_to_bot=is_rep_bot,
+                    is_bystander_quote=is_bystander_q,
+                    is_stale_quote=is_stale_q,
                 )
             if st.cheap is None:
                 st.cheap = interaction_scaffold.decide_cheap_gate(
@@ -355,28 +373,13 @@ class PreparePhase(RunOnceHost):
             )
             if _vh:
                 st.final_user_message = _append_user_text(st.final_user_message, f"\n{_vh}")
-            # 旁观轮仍收窄到 group_idle_max_iterations；省略续聊轮要跑得完
-            # find_tools → 真正查询的两跳链路，早先的收窄条件误伤了它们。
-            if self.max_iterations is None and st.limits is not None:
-                from gsuid_core.ai_core.agent_run.tools import group_idle_request_limit
-
-                _idle_raw = ai_config.get_config("group_idle_max_iterations").data
-                _idle_cap = int(_idle_raw) if isinstance(_idle_raw, int) else 2
-                _capped = group_idle_request_limit(
-                    int(st.limits.request_limit or 0),
-                    is_group=bool(st.tg.is_group),
-                    followup_detected=bool(st.followup_detected),
-                    has_active_task=st.has_active_task,
-                    idle_cap=_idle_cap,
-                    call_to_self=bool(st.tg.call_to_self),
-                )
-                if _capped != st.limits.request_limit:
-                    st.limits = UsageLimits(request_limit=_capped)
             _hints = interaction_scaffold.scaffold_hints_from_graph(
                 st.tg,
                 cheap=st.cheap,
                 speaker_recall=self.dynamic_tools is not False,
                 intent=str(st.intent or ""),
+                persona_name=self.persona_name,
+                route_decision=self.route_decision,
             )
             # C-2：≥2 且比上轮增加才保留漂移提醒（hints 里可能已有，按计数裁）
             _pushes = st.tg.style_push_count
@@ -399,33 +402,12 @@ class PreparePhase(RunOnceHost):
                 and self._unmet_tool_promise
                 and st.intent not in _PROGRESSIVE_TOOLS_SKIP_INTENTS
             ):
-                no_tool_reminder = (
-                    "\n\n（系统：上一轮你已经决定调用某个工具，但没有真正调用。"
-                    "本轮去调用它。若其实不必用工具，直接回答，不要为这条提示再找工具。）"
-                )
-                st.final_user_message = _append_user_text(st.final_user_message, no_tool_reminder)
+                st.final_user_message = _append_user_text(st.final_user_message, UNMET_TOOL_REMINDER)
                 logger.debug(i18n_t("log.agent.forced_nudge_consecutive_turns"))
 
-        # 用户追问进行中任务：再判一次（用 last_user_question 剥壳后）并注入进度契约
-        if not st.fw_msg and not st.status_inquiry:
-            st.status_inquiry = looks_like_status_inquiry(
-                st.last_user_question,
-                has_active_task=st.has_active_task,
-            )
-            if st.status_inquiry and st.has_active_task:
-                st.speech_policy = resolve_speech_policy(
-                    is_framework=False,
-                    fake_done_retry=st.fake_done_retry,
-                    is_status_inquiry=True,
-                    has_active_task=True,
-                    user_text=st.last_user_question,
-                )
         if st.status_inquiry and st.has_active_task and self.create_by in ("Chat", "Agent"):
             st.final_user_message = _append_user_text(st.final_user_message, _STATUS_INQUIRY_HINT)
             logger.debug(i18n_t("log.agent.scaffold_ellipsis_style_follow_inject"))
-        if not st.fw_msg and st.has_active_task:
-            st.in_flight_short = spoken_user_body_len(st.last_user_question) <= 48
-        st.run_extra["speech_policy"] = st.speech_policy
 
         # 先钉一次：本轮 lean 必须带 marker，否则 _relean 会从持久 history 剥掉。
         self._inject_deepseek_rp_marker(st)
@@ -437,7 +419,11 @@ class PreparePhase(RunOnceHost):
         # session logger：框架注入单独记账，不计入 user_input
         self._session_logger.log_run_start()
         if st.fw_msg and isinstance(st.final_user_message, str):
-            self._session_logger.log_system_injection(st.final_user_message, source="framework")
+            self._session_logger.log_system_injection(
+                st.final_user_message,
+                source="framework",
+                reason=st.injection_reason,
+            )
         else:
             self._session_logger.log_user_input(st.final_user_message)
 
@@ -445,14 +431,34 @@ class PreparePhase(RunOnceHost):
             st.tools = []
 
     def _inject_deepseek_rp_marker(self, st: RunOnceState) -> None:
-        if self.create_by != "Chat" or not ai_config.get_config("enable_deepseek_rp").data:
+        if self.create_by not in ("Chat", "Agent"):
             return
-        st.final_user_message, st.lean_user_message, where = _ensure_inner_os_on_first_user(
+        marker = INNER_OS_MARKER if ai_config.get_config("enable_deepseek_rp").data else ""
+        persona_name = self.persona_name or ""
+        group_id = st.ev.group_id if st.ev is not None else None
+        st.final_user_message, st.lean_user_message, where, latest_ts = _ensure_session_anchor_on_first_user(
             self.history,
             st.final_user_message,
             st.lean_user_message,
-            INNER_OS_MARKER,
+            persona_name=persona_name,
+            group_id=group_id,
+            marker=marker,
             is_framework=st.fw_msg,
         )
         if where in ("history", "current"):
-            logger.info(i18n_t("log.agent.ds_inject"))
+            if latest_ts > 0.0:
+                self._anchor_journal_ts = latest_ts
+            if marker:
+                logger.info(i18n_t("log.agent.ds_inject"))
+        elif where == "already" and persona_name and not st.fw_msg:
+            from gsuid_core.ai_core.journal.manager import read_journal_for_context
+
+            since_ts = self._anchor_journal_ts if self._anchor_journal_ts > 0.0 else 0.01
+            delta_text, latest_ts = read_journal_for_context(
+                persona_name,
+                current_group_id=group_id,
+                since_ts=since_ts,
+            )
+            if delta_text:
+                st.final_user_message = _append_user_text(st.final_user_message, f"\n{delta_text}")
+                self._anchor_journal_ts = latest_ts

@@ -22,7 +22,12 @@ from gsuid_core.logger import logger
 from gsuid_core.models import Event
 from gsuid_core.message_history import get_history_manager
 from gsuid_core.ai_core.statistics import statistics_manager
-from gsuid_core.ai_core.persona.config import persona_config_manager, persona_should_inspect_session
+from gsuid_core.ai_core.persona.config import (
+    read_autonomy_runtime,
+    is_within_active_hours,
+    persona_config_manager,
+    persona_should_inspect_session,
+)
 from gsuid_core.ai_core.heartbeat.decision import run_heartbeat
 
 # 并发控制：最多同时进行 5 个 LLM 调用
@@ -41,6 +46,7 @@ class HeartbeatInspector:
         self._history_manager = get_history_manager()
         self._scheduled_jobs: dict[str, str] = {}  # persona_name -> job_id
         self._semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM_CALLS)
+        self._last_decision_human_sig: dict[str, str] = {}
 
     @property
     def is_running(self) -> bool:
@@ -140,10 +146,15 @@ class HeartbeatInspector:
 
     async def _inspect_all_sessions_for_persona(self, persona_name: str) -> None:
         """巡检所有与指定 persona 相关的会话"""
+        config = persona_config_manager.get_config(persona_name)
+        runtime = read_autonomy_runtime(config)
+        if not is_within_active_hours(list(runtime.active_hours), runtime.timezone):
+            logger.info(t("log.ai.active_hours_skip", persona_name=persona_name, kind="定时巡检"))
+            return
+
         logger.info(t("log.ai.heartbeat_persona_name_periodic_start_2", persona_name=persona_name))
 
         # 获取该 persona 配置的 target_groups
-        config = persona_config_manager.get_config(persona_name)
         scope = config.get_config("scope").data
         target_groups = config.get_config("target_groups").data
 
@@ -164,7 +175,7 @@ class HeartbeatInspector:
                 continue
 
             # 前置规则过滤：快速判断是否需要巡检
-            should_check, skip_reason = self._pre_check_session(session_key)
+            should_check, skip_reason = self._pre_check_session(session_key, persona_name)
             if not should_check:
                 logger.debug(
                     t(
@@ -208,7 +219,7 @@ class HeartbeatInspector:
                     )
                 )
 
-    def _pre_check_session(self, event: Event) -> Tuple[bool, str]:
+    def _pre_check_session(self, event: Event, persona_name: str = "") -> Tuple[bool, str]:
         """
         前置轻量级规则过滤，快速判断是否需要巡检。
         避免对每个会话都调用 LLM，节省 Token 消耗。
@@ -249,7 +260,8 @@ class HeartbeatInspector:
             return False, "C8 网关抑制（近期已有主动输出，防撞车）"
 
         # C-3：主动发言频率硬上限（每小时/每天），超限直接跳过，连决策 LLM 都不调
-        if dispatcher.should_suppress_by_rate(target_key):
+        session_persona = persona_config_manager.get_persona_for_session(event.session_id) or persona_name
+        if dispatcher.should_suppress_by_rate(target_key, persona_name=session_persona):
             return False, "C-3 频率上限（近期主动发言已达上限）"
 
         return True, ""
@@ -317,17 +329,50 @@ class HeartbeatInspector:
             logger.debug(t("log.ai.heartbeat_session_event_persona", event=event))
             return
 
+        import time
+
+        from gsuid_core.ai_core.persona.presence import refresh_persona_state
+        from gsuid_core.ai_core.persona.homeostasis import heartbeat_should_skip
+
+        _homeo_state, _ribbon = await refresh_persona_state(session_persona_name, time.time())
+        if heartbeat_should_skip(_homeo_state):
+            statistics_manager.record_heartbeat_decision(event.group_id or "", should_speak=False)
+            logger.debug(t("log.ai.heartbeat_homeostasis_skip", persona_name=session_persona_name))
+            return
+
         # 决策阶段：从网关取近期定时任务摘要合并进决策语境。
         from gsuid_core.ai_core.heartbeat.dispatcher import get_dispatcher
 
         dispatcher = get_dispatcher()
         target_key = self._target_key(event, history)
         merge_ctx = dispatcher.peek_merge_context(target_key)
+        staged_arc = dispatcher.peek_staged(target_key, source="autonomy", persona_name=session_persona_name)
+
+        # 确定性前置：若无新人类发言且无待合并事件，跳过 LLM 决策
+        last_human = next((r for r in reversed(history) if r.role == "user"), None)
+        if last_human is None:
+            statistics_manager.record_heartbeat_decision(
+                group_id=group_id or "",
+                should_speak=False,
+            )
+            return
+
+        human_sig = f"{last_human.timestamp}:{last_human.user_id}:{len(history)}"
+        if self._last_decision_human_sig.get(target_key) == human_sig and not merge_ctx:
+            logger.debug(t("log.ai.heartbeat_session_history_unchanged_skip", target_key=target_key))
+            statistics_manager.record_heartbeat_decision(
+                group_id=group_id or "",
+                should_speak=False,
+            )
+            return
+        self._last_decision_human_sig[target_key] = human_sig
+
         meta = await run_heartbeat(
             event,
             history,
             session_persona_name,
             extra_context=merge_ctx,
+            staged_arc=staged_arc,
         )
         if not meta:
             logger.debug(t("log.ai.heartbeat_session_event_generated_send", event=event))
@@ -344,9 +389,34 @@ class HeartbeatInspector:
             source="heartbeat",
             trigger_reason=mood,
             generator_log_files=generator_log_files,
+            persona_name=session_persona_name,
         )
         if sent:
             dispatcher.consume_merge_context(target_key)
+
+            # 弧带出的结算：模型这句真的提到弧内容才算 hit，否则留着下轮再带
+            if staged_arc:
+                from gsuid_core.ai_core.autonomy.micro_arc import (
+                    ready_arcs_for,
+                    load_micro_arcs,
+                    save_micro_arcs,
+                    topic_mentioned,
+                    consolidate_for_target,
+                )
+                from gsuid_core.ai_core.heartbeat.dispatcher import ngram_jaccard
+
+                _gid = str(event.group_id or "")
+                _uid = str(event.user_id or "") if event.user_type == "direct" else ""
+                _arcs = await load_micro_arcs(session_persona_name)
+                _ready = ready_arcs_for(_arcs, _gid, _uid, time.time())
+                _hit = (
+                    any(topic_mentioned(a["topic_key"], message) for a in _ready)
+                    or ngram_jaccard(staged_arc, message, 2) >= 0.12
+                )
+                if _hit:
+                    dispatcher.consume_staged(target_key, source="autonomy", persona_name=session_persona_name)
+                    consolidate_for_target(_arcs, _gid, _uid)
+                    await save_micro_arcs(session_persona_name, _arcs)
 
     def _get_history(self, event: Event) -> List[Any]:
         """获取会话的全部历史记录"""

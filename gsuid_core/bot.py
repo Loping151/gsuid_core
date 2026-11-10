@@ -1,15 +1,39 @@
 import time
 import asyncio
 import inspect
-from typing import Any, Dict, List, Union, Literal, Mapping, Optional, Coroutine
+from enum import StrEnum
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Tuple,
+    Union,
+    Literal,
+    Mapping,
+    Optional,
+    Coroutine,
+)
+
+if TYPE_CHECKING:
+    from gsuid_core.message_history import MessageRecord
 
 from fastapi import WebSocket
 from msgspec import json as msgjson
 from starlette.websockets import WebSocketState
 
+import gsuid_core.i18n as i18n
 from gsuid_core.i18n import t
-from gsuid_core.logger import logger
-from gsuid_core.models import Event, Message, MessageSend, TaskContext, MessageReceive
+from gsuid_core.logger import logger, trace_collector, bind_trace_context, clear_trace_context
+from gsuid_core.models import (
+    Event,
+    Message,
+    MessageSend,
+    TaskContext,
+    MessageReceive,
+    format_node_preview,
+    normalize_node_items,
+)
 from gsuid_core.segment import (
     MessageSegment,
     to_markdown,
@@ -26,8 +50,11 @@ from gsuid_core.load_template import (
     button_templates,
 )
 from gsuid_core.message_models import Button, ButtonType
-from gsuid_core.ai_core.wall_clock import pause_wall_clock
+from gsuid_core.message_history import get_history_manager, node_items_to_history
+from gsuid_core.ai_core.outbound import get_outbound_image_label
+from gsuid_core.utils.image.image_tools import normalize_image_for_history
 from gsuid_core.ai_core.configs.ai_config import ai_config
+from gsuid_core.ai_core.command_aside.capture import capture_outbound
 from gsuid_core.utils.plugins_config.gs_config import (
     bm_config,
     sp_config,
@@ -54,6 +81,25 @@ RECALL_WAIT_TIMEOUT: float = 10.0
 # 连续 N 次「整次调用一帧都没回执」后，将该连接标记为"不支持回执"，后续 wait_recall=True
 # 直接返回空结果不再等待；任意一帧成功回执即清零。避免旧 adapter 反复吃满超时。
 RECALL_DISABLE_AFTER_TIMEOUTS: int = 3
+BOT_RETAIN_TIMEOUT: float = 300.0
+
+
+class BotConnectionState(StrEnum):
+    CONNECTED = "connected"
+    RETAINED = "retained"
+    EXPIRED = "expired"
+
+
+class RecallCapabilityState(StrEnum):
+    PROBING = "probing"
+    SUPPORTED = "supported"
+    UNSUPPORTED = "unsupported"
+
+
+class BotReceiveMode(StrEnum):
+    IDLE = "idle"
+    SINGLE = "single"
+    MULTI = "multi"
 
 
 def _truncate_for_log(obj: Any, max_str_len: int = 100) -> Any:
@@ -90,6 +136,39 @@ def _truncate_for_log(obj: Any, max_str_len: int = 100) -> Any:
     return obj
 
 
+_DIRECT_AT_DEPTH = 8
+
+
+def _without_direct_at(messages: list[Message], depth: int = 0) -> tuple[list[Message], int]:
+    """去掉 at 段。私聊协议不接受 at，嵌在合并转发里的也去掉。"""
+    kept: list[Message] = []
+    dropped = 0
+    for msg in messages:
+        if msg.type == "at":
+            dropped += 1
+            continue
+        raw_items = msg.data
+        if msg.type != "node" or not isinstance(raw_items, list) or depth >= _DIRECT_AT_DEPTH:
+            kept.append(msg)
+            continue
+        inner: list[Message] = []
+        opaque = False
+        for item in raw_items:
+            if not isinstance(item, Message):
+                opaque = True
+                break
+            inner.append(item)
+        if opaque:
+            kept.append(msg)
+            continue
+        cleaned, nested_dropped = _without_direct_at(inner, depth + 1)
+        dropped += nested_dropped
+        if not cleaned:
+            continue
+        kept.append(Message(type="node", data=cleaned) if nested_dropped else msg)
+    return kept, dropped
+
+
 def message_list_to_str(messages: list[Message]) -> str:
     """将 Message 列表转为字符串"""
     s: list[str] = []
@@ -103,7 +182,8 @@ def message_list_to_str(messages: list[Message]) -> str:
         elif m.type == "video":
             s.append("[视频]")
         elif m.type == "file":
-            s.append("[文件]")
+            fname = m.data.split("|", 1)[0] if isinstance(m.data, str) else ""
+            s.append(f"[文件 {fname}]" if fname else "[文件]")
         elif m.type == "node":
             s.append("[合并转发]")
     return "\n".join(s)
@@ -134,6 +214,40 @@ class _Bot:
         self._supports_recall: Optional[bool] = None
         # 连续「整次调用零回执」计数，达到阈值后将 _supports_recall 置 False
         self._recall_timeout_streak: int = 0
+        # echo -> MessageRecord 出站消息记录关联表（用于回执异步回写平台 msg_id）
+        self._echo_records: Dict[str, "MessageRecord"] = {}
+
+    def get_connection_state(
+        self,
+        now: Optional[float] = None,
+        timeout: float = BOT_RETAIN_TIMEOUT,
+    ) -> BotConnectionState:
+        """返回当前连接生命周期状态：connected / retained / expired。"""
+        if self.bot is not None:
+            return BotConnectionState.CONNECTED
+        ts = time.time() if now is None else now
+        if self._disconnected_at is None or (ts - self._disconnected_at) > timeout:
+            return BotConnectionState.EXPIRED
+        return BotConnectionState.RETAINED
+
+    @property
+    def connection_state(self) -> BotConnectionState:
+        return self.get_connection_state()
+
+    @property
+    def recall_capability_state(self) -> RecallCapabilityState:
+        """返回回执能力三态：probing / supported / unsupported。"""
+        if self._supports_recall is True:
+            return RecallCapabilityState.SUPPORTED
+        if self._supports_recall is False:
+            return RecallCapabilityState.UNSUPPORTED
+        return RecallCapabilityState.PROBING
+
+    def _register_echo_record(self, echo: str, record: "MessageRecord") -> None:
+        if len(self._echo_records) >= 1000:
+            for k in list(self._echo_records.keys())[:200]:
+                self._echo_records.pop(k, None)
+        self._echo_records[echo] = record
 
     def _add_bg_task(self, task: asyncio.Task) -> None:
         """将后台任务加入 bg_tasks，并注册完成时自动移除的回调。
@@ -215,10 +329,20 @@ class _Bot:
             return False
         data = seg.data
         if isinstance(data, dict) and "echo" in data and data["echo"] is not None:
-            fut = self._recall_waiters.pop(str(data["echo"]), None)
+            echo_key = str(data["echo"])
+            fut = self._recall_waiters.pop(echo_key, None)
+            rec = self._echo_records.pop(echo_key, None)
+            _mid = data["id"] if "id" in data else None
+            if rec is not None and rec.metadata is not None and _mid is not None:
+                new_id = str(_mid[0]) if isinstance(_mid, list) else str(_mid)
+                rec.metadata["msg_id"] = new_id
+                if "msg_id_list" not in rec.metadata:
+                    rec.metadata["msg_id_list"] = []
+                m_list = rec.metadata["msg_id_list"]
+                if isinstance(m_list, list) and new_id not in m_list:
+                    m_list.append(new_id)
             if fut is not None and not fut.done():
                 # 消息 ID 统一规范化为 str，多条发送返回的 list 在外层扁平化处理。
-                _mid = data["id"] if "id" in data else None
                 if _mid is None:
                     fut.set_result(None)
                 elif isinstance(_mid, list):
@@ -261,6 +385,7 @@ class _Bot:
         wait_recall: bool = False,
     ) -> Optional[List[str]]:
         try:
+            # core_command 包初始化会 import SV，SV 再 import Bot。
             from gsuid_core.buildin_plugins.core_command.core_ai_control.state import (
                 is_scope_banned,
                 get_target_scope_key,
@@ -280,11 +405,10 @@ class _Bot:
             logger.debug(t("log.bot.mute_check_fail", error=e))
 
         # 记录 bot 回复到历史记录
+        # 真正的 add_message 挪到转换之后：控制台要看的是最终发出去的那条
+        _record: Optional["MessageRecord"] = None
+        _hist_pending: Optional[Tuple[Event, str, Dict[str, Any]]] = None
         try:
-            from gsuid_core.message_history import get_history_manager
-
-            history_manager = get_history_manager()
-
             # 确定 group_id 和 user_id
             if target_type == "direct":
                 _hist_group_id = None
@@ -301,8 +425,6 @@ class _Bot:
             if isinstance(message, str):
                 # 检查是否是 base64 图片
                 if message.startswith("base64://"):
-                    from gsuid_core.ai_core.outbound import get_outbound_image_label
-
                     content = get_outbound_image_label() or "[图片]"
                     metadata["type"] = "base64_image"
                 else:
@@ -314,23 +436,41 @@ class _Bot:
                 # 处理消息列表
                 text_parts = []
                 image_count = 0
+                out_images = []
+                node_items: List[Dict[str, Any]] = []
                 for msg in message:
                     if isinstance(msg, Message):
                         if msg.type == "text":
                             text_parts.append(str(msg.data))
+                        elif msg.type == "node":
+                            # 合并转发：子项进 metadata 供控制台展开，正文落摘要而不是 [node]
+                            node_items.extend(node_items_to_history(normalize_node_items(msg.data)))
+                            text_parts.append(format_node_preview(normalize_node_items(msg.data)))
                         elif msg.type == "image":
                             image_count += 1
+                            if msg.data:
+                                try:
+                                    norm = normalize_image_for_history(msg.data)
+                                    if norm:
+                                        out_images.append(norm)
+                                except Exception:
+                                    pass
                         elif msg.type == "at":
                             text_parts.append(f"@{msg.data}")
+                        elif msg.type == "file":
+                            fname = msg.data.split("|", 1)[0] if isinstance(msg.data, str) else ""
+                            text_parts.append(f"[文件 {fname}]" if fname else "[文件]")
                         else:
                             text_parts.append(f"[{msg.type}]")
                     elif isinstance(msg, str):
                         text_parts.append(msg)
                 content = " ".join(text_parts)
+                if node_items:
+                    metadata["node"] = node_items
+                if out_images:
+                    metadata["images"] = out_images
                 if image_count > 0:
                     metadata["image_count"] = image_count
-                    from gsuid_core.ai_core.outbound import get_outbound_image_label
-
                     label = get_outbound_image_label()
                     if label:
                         content = f"{content} {label}".strip() if content else label
@@ -339,16 +479,30 @@ class _Bot:
             elif isinstance(message, Message):
                 if message.type == "text":
                     content = str(message.data)
+                elif message.type == "node":
+                    # 合并转发：子项进 metadata，正文落摘要
+                    metadata["node"] = node_items_to_history(normalize_node_items(message.data))
+                    content = format_node_preview(normalize_node_items(message.data))
                 elif message.type == "image":
-                    from gsuid_core.ai_core.outbound import get_outbound_image_label
-
                     content = get_outbound_image_label() or "[图片]"
                     metadata["type"] = "image"
+                    if message.data:
+                        try:
+                            norm = normalize_image_for_history(message.data)
+                            if norm:
+                                metadata["images"] = [norm]
+                        except Exception:
+                            pass
+                elif message.type == "file":
+                    fname = message.data.split("|", 1)[0] if isinstance(message.data, str) else ""
+                    content = f"[文件 {fname}]" if fname else "[文件]"
+                    metadata["type"] = "file"
                 else:
                     content = f"[{message.type}]"
 
             # 构造 Event 对象用于记录历史（WS_BOT_ID 即 self.bot_id）
             if content and _hist_user_id:
+                # utils 顶层 import Bot，提到模块顶会和本文件成环。
                 from gsuid_core.ai_core.utils import is_silence_marker
 
                 if not is_silence_marker(content):
@@ -363,6 +517,7 @@ class _Bot:
                     # 显式 merge：调用方传入的 extra_metadata 覆盖默认推断的 type/image_count
                     if extra_metadata:
                         metadata.update(extra_metadata)
+                    # history_format -> ai_core.models 顶层 import Bot，不能提到模块顶。
                     from gsuid_core.ai_core.history_format import outbound_history_fields
 
                     sender = sender_id.strip() if isinstance(sender_id, str) else ""
@@ -373,13 +528,7 @@ class _Bot:
                             sender_id=sender,
                         )
                     )
-                    history_manager.add_message(
-                        event=ev,
-                        role="assistant",
-                        content=content,
-                        user_name="AI",
-                        metadata=metadata,
-                    )
+                    _hist_pending = (ev, content, metadata)
         except Exception as e:
             logger.debug(t("log.bot.record_history_fail", error=e))
 
@@ -395,6 +544,36 @@ class _Bot:
                 None,
                 bot_id,
             )
+
+        # 控制台「会话管理」要还原的是**最终发出去的那条**：转换、markdown 之后，
+        # 连 text2pic、node 拆帧都算完的形态。所以入库与广播都放在这里。
+        if _hist_pending is not None:
+            try:
+                from gsuid_core.message_history import segments_from_messages
+
+                _hist_ev, _hist_content, _hist_meta = _hist_pending
+                # add_message 存的是 event.user_id（提问的人），机器人自己发的那条
+                # 得单独记一份身份，控制台才显示得出头像和昵称
+                _hist_meta["sender"] = {
+                    "user_id": bot_self_id or bot_id,
+                    "nickname": bot_self_id or bot_id or "机器人",
+                }
+                from gsuid_core.ai_core.persona.speaking_ctx import get_speaking_persona
+
+                # 多人格：给 assistant 历史打上「谁在说」，dyadic/回放按人格归因
+                _speaking = get_speaking_persona()
+                if _speaking:
+                    _hist_meta["persona_name"] = _speaking
+                _record = get_history_manager().add_message(
+                    event=_hist_ev,
+                    role="assistant",
+                    content=_hist_content,
+                    user_name="AI",
+                    metadata=_hist_meta,
+                    segments=segments_from_messages(_message),
+                )
+            except Exception as e:
+                logger.debug(t("log.bot.record_history_fail", error=e))
 
         _message_result = []
         message_result: List[List[Message]] = []
@@ -450,6 +629,10 @@ class _Bot:
         _recall_requested: bool = wait_recall and task_event is None
         # _use_recall：在请求基础上，还要确有可发送帧 + 该连接未被判定为不支持，才真正登记 future。
         _use_recall: bool = _recall_requested and bool(message_result) and self._supports_recall is not False
+        # 是否跟踪 echo 关联以回写出站 msg_id（有历史记录待回写且连接未被判定为不支持）
+        _track_echo: bool = (
+            (_record is not None or _use_recall) and bool(message_result) and self._supports_recall is not False
+        )
         # 按帧登记，保持帧序（用于最终按序收集）
         _recall_echos: List[str] = []
         _recall_futs: List[asyncio.Future] = []
@@ -466,15 +649,26 @@ class _Bot:
                 if group_id:
                     mr.append(Message("group", group_id))
 
+                # QQ 私聊收到 at 段会整包解析失败，合并转发内部的 at 一并去掉
+                if target_type == "direct":
+                    mr, dropped_at = _without_direct_at(mr)
+                    if dropped_at:
+                        logger.debug(t("log.bot.drop_direct_at", count=dropped_at))
+                    if not any(seg.type != "group" for seg in mr):
+                        continue
+
                 # 本帧 echo：每帧各一，发前登记，避免回执先于登记到达的竞态
                 _echo: Optional[str] = None
-                if _use_recall:
+                if _track_echo:
                     self._echo_seq += 1
                     _echo = str(self._echo_seq)
-                    _fut: asyncio.Future = asyncio.get_running_loop().create_future()
-                    self._recall_waiters[_echo] = _fut
-                    _recall_echos.append(_echo)
-                    _recall_futs.append(_fut)
+                    if _use_recall:
+                        _fut: asyncio.Future = asyncio.get_running_loop().create_future()
+                        self._recall_waiters[_echo] = _fut
+                        _recall_echos.append(_echo)
+                        _recall_futs.append(_fut)
+                    if _record is not None:
+                        self._register_echo_record(_echo, _record)
 
                 send = MessageSend(
                     content=mr,
@@ -490,28 +684,34 @@ class _Bot:
 
                 local_val["send"] += 1
 
+                # memory 包的 __init__ 会 import server，server 再 import Bot。
                 from gsuid_core.ai_core.memory.config import memory_config
 
                 enable_ai: bool = ai_config.get_config("enable").data
                 is_enable_memory: bool = ai_config.get_config("enable_memory").data
                 memory_mode: list[str] = memory_config.memory_mode
                 if enable_ai and is_enable_memory and "主动会话" in memory_mode:
+                    # 仅在 AI 人格发言上下文中观察出站回复，避免普通插件命令污染未启用群
                     from gsuid_core.ai_core.memory import observe
+                    from gsuid_core.ai_core.persona.speaking_ctx import get_speaking_persona
 
-                    try:
-                        task = asyncio.create_task(
-                            observe(
-                                content=message_list_to_str(mr),
-                                speaker_id=f"__assistant_{bot_id}__",
-                                group_id=target_id if target_type == "group" else None,
-                                bot_self_id=bot_self_id,
-                                observer_blacklist=memory_config.observer_blacklist,
-                                message_type="group_msg" if target_type == "group" else "private_msg",
+                    speaking_persona = get_speaking_persona()
+                    if speaking_persona:
+                        try:
+                            task = asyncio.create_task(
+                                observe(
+                                    content=message_list_to_str(mr),
+                                    speaker_id=f"__assistant_{bot_id}__",
+                                    group_id=target_id if target_type == "group" else None,
+                                    bot_self_id=bot_self_id,
+                                    observer_blacklist=memory_config.observer_blacklist,
+                                    message_type="group_msg" if target_type == "group" else "private_msg",
+                                    persona_name=speaking_persona,
+                                )
                             )
-                        )
-                        self._add_bg_task(task)
-                    except Exception:
-                        pass  # Observer 失败不应影响主流程
+                            self._add_bg_task(task)
+                        except Exception:
+                            pass  # Observer 失败不应影响主流程
                 # ============================================
 
                 logger.info(
@@ -563,6 +763,8 @@ class _Bot:
 
             # 能力探测：拿到任意真实 id 才算"支持回执"。断连会 set_result(None)，
             # 不能据此误判为支持——否则 _supports_recall 永远停在 True，无法再 latch 为不支持。
+            if _record is not None and ids and _record.metadata is not None:
+                _record.metadata["msg_id"] = str(ids[0])
             if ids:
                 self._supports_recall = True
                 self._recall_timeout_streak = 0
@@ -691,12 +893,6 @@ class _Bot:
         # ── 启动追踪并绑定上下文 ──
         trace_ctx = getattr(ctx, "trace_context", None)
         if trace_ctx is not None:
-            from gsuid_core.logger import (
-                trace_collector,
-                bind_trace_context,
-                clear_trace_context,
-            )
-
             trace_collector.start_trace(trace_ctx)
             bind_trace_context(trace_ctx)
 
@@ -767,8 +963,19 @@ class Bot:
         self.receive_tag = False
         self.mutiply_tag = False
         self.mutiply_resp: List[Event] = []
+        self.event: asyncio.Event = asyncio.Event()
+        self.mutiply_event: asyncio.Event = asyncio.Event()
         # 当前用户语言缓存（懒解析，一次事件内复用），见 get_lang()
         self._lang: Optional[str] = None
+
+    @property
+    def receive_mode(self) -> BotReceiveMode:
+        """返回当前交互等待状态：idle / single / multi。"""
+        if self.mutiply_tag:
+            return BotReceiveMode.MULTI
+        if self.receive_tag:
+            return BotReceiveMode.SINGLE
+        return BotReceiveMode.IDLE
 
     @property
     def logger(self) -> GsLogger:
@@ -806,6 +1013,7 @@ class Bot:
     async def get_lang(self) -> str:
         """当前用户语言：用户自定义 > 全局 LANGUAGE；结果缓存到本 Bot 实例。"""
         if self._lang is None:
+            # database.models 顶层 import Bot，提到模块顶会成环。
             from gsuid_core.utils.database.models import CoreUser
 
             self._lang = await CoreUser.get_user_lang(self.ev.user_id)
@@ -813,9 +1021,7 @@ class Bot:
 
     async def t(self, key: str, /, **params: Any) -> str:
         """按当前用户语言翻译「发给用户看」的文案（用户自定义 > 全局 LANGUAGE）。"""
-        from gsuid_core.i18n import t as _t
-
-        return _t(key, lang=await self.get_lang(), **params)
+        return i18n.t(key, lang=await self.get_lang(), **params)
 
     @classmethod
     def get_instances(cls):
@@ -1019,10 +1225,8 @@ class Bot:
 
                 self.mutiply_event = asyncio.Event()
 
-            # 等人作答的时长不计入 AI 的墙钟软预算（不在 Agent run 内时是空操作）
-            async with pause_wall_clock():
-                while self.mutiply_resp == []:
-                    await asyncio.wait_for(self.mutiply_event.wait(), timeout)
+            while self.mutiply_resp == []:
+                await asyncio.wait_for(self.mutiply_event.wait(), timeout)
 
             self.mutiply_event = asyncio.Event()
             return self.mutiply_resp.pop(0)
@@ -1031,8 +1235,7 @@ class Bot:
             self.instances[self.session_id] = self
             self.event = asyncio.Event()
             try:
-                async with pause_wall_clock():
-                    result = await self.wait_for_key(timeout)
+                result = await self.wait_for_key(timeout)
             finally:
                 # 无论正常返回还是超时异常，都清理单轮交互引用
                 self.receive_tag = False
@@ -1046,6 +1249,7 @@ class Bot:
         extra_metadata: Optional[Mapping[str, object]] = None,
         wait_recall: bool = False,
     ) -> Optional[List[str]]:
+        await capture_outbound(message)
         return await self.bot.target_send(
             message,
             self.ev.user_type,
@@ -1134,6 +1338,7 @@ class Bot:
         send_source_group: Optional[str] = None,
         wait_recall: bool = False,
     ) -> Optional[List[str]]:
+        await capture_outbound(message)
         return await self.bot.target_send(
             message,
             target_type,

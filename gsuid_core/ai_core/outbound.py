@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 import time
-from typing import Optional, NamedTuple
+from typing import Match, Callable, Iterator, Optional, NamedTuple
 from datetime import datetime
 from contextvars import Token, ContextVar
 from dataclasses import dataclass
@@ -34,6 +34,12 @@ def ledger_group_key(ev: Event | None, *, group_id: str = "", user_id: str = "")
         return group_id
     uid = str(ev.user_id) if ev is not None and ev.user_id else user_id
     return f"direct:{uid}" if uid else ""
+
+
+def format_meme_placeholder(mood: str) -> str:
+    """群聊历史里的表情占位。只放情绪词，方便记忆摄入当文字表情跳过。"""
+    word = (mood or "").strip()
+    return f"[表情:{word}]" if word else "[表情]"
 
 
 def format_outbound_image_placeholder(topic: str, res_id: str) -> str:
@@ -73,17 +79,96 @@ def reset_run_image_delivered() -> None:
     _run_image_delivered.set(False)
 
 
+# 话题标题里去掉裸 @平台ID。聊天强提醒不走这条。
+_AT_ID_RE = re.compile(r"@([0-9A-Za-z][0-9A-Za-z_\-]{2,64})")
+_PLATFORM_ID_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z_\-]{2,64}")
+# 转义括号放在裸尖括号前，避免 \<@id\> 只吃掉中间的 <。
+_MENTION_OPEN = r"(?:\\<|&lt;|&#60;|＜|<)"
+_MENTION_CLOSE = r"(?:\\>|&gt;|&#62;|＞|>)"
+_MENTION_RE = re.compile(
+    _MENTION_OPEN + r"\s*@\s*([^<>]{1,64}?)\s*" + _MENTION_CLOSE,
+    re.IGNORECASE,
+)
+_CQ_AT_RE = re.compile(r"\[CQ:at\s*,\s*qq=([^,\]\s]+)(?:,[^\]]*)?\]")
+_DELIVERY_TASK_TITLE_RE = re.compile(r"任务#\d+「([^」]+)」")
+
+
+def normalize_mention_token(raw: str) -> str:
+    """括号内的空格去掉。名称和用户 ID 都不靠空格区分。"""
+    return re.sub(r"\s+", "", raw)
+
+
+def is_mention_id(token: str) -> bool:
+    """纯数字，或带数字的平台 ID。纯单词不是接收人。"""
+    if not token:
+        return False
+    if token.isdigit():
+        return True
+    return _PLATFORM_ID_RE.fullmatch(token) is not None and any(ch.isdigit() for ch in token)
+
+
+def iter_mentions(text: str) -> Iterator[Match[str]]:
+    """扫描 <@用户ID> / <@名称>。认转义尖括号和括号内外的空格。"""
+    return _MENTION_RE.finditer(text or "")
+
+
+def sub_mentions(text: str, repl: Callable[[Match[str]], str]) -> str:
+    if not text:
+        return text
+    return _MENTION_RE.sub(repl, text)
+
+
+def strip_mention_tags(text: str) -> str:
+    if not text:
+        return text
+    return _MENTION_RE.sub("", text)
+
+
+def rewrite_cq_at(text: str) -> str:
+    """把 [CQ:at,qq=ID] 收成 <@ID>。出站解析、主动消息历史、话题标题共用。"""
+    if not text:
+        return text
+    return _CQ_AT_RE.sub(r"<@\1>", text)
+
+
+def _clean_topic_head(raw: str, max_len: int = 12) -> str:
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    m = _DELIVERY_TASK_TITLE_RE.search(s)
+    if m is not None:
+        s = m.group(1).strip()
+    s = _AT_ID_RE.sub("", strip_mention_tags(rewrite_cq_at(s))).strip()
+    head = s.split("\n", 1)[0].strip()
+    return head[:max_len]
+
+
 def topic_from_extra(extra: dict[str, object]) -> str:
     raw = extra["outbound_topic"] if "outbound_topic" in extra else ""
     if isinstance(raw, str) and raw.strip():
-        return raw.strip()[:12]
+        return _clean_topic_head(raw, 12)
     return ""
 
 
 def remember_outbound_topic(extra: dict[str, object], task_head: str) -> None:
-    head = (task_head or "").strip().split("\n", 1)[0].strip()[:12]
+    head = _clean_topic_head(task_head, 12)
     if head:
         extra["outbound_topic"] = head
+
+
+async def ensure_outbound_topic_from_artifact(extra: dict[str, object], image_id: str) -> None:
+    if not image_id.startswith("res_") or topic_from_extra(extra) or not _db_ready():
+        return
+    from sqlalchemy.exc import OperationalError, ProgrammingError
+
+    from gsuid_core.ai_core.planning.models import AIAgentArtifact
+
+    try:
+        art = await AIAgentArtifact.get_by_id(image_id)
+    except (OperationalError, ProgrammingError):
+        return
+    if art is not None and art.summary:
+        remember_outbound_topic(extra, art.summary)
 
 
 @dataclass(frozen=True)
@@ -92,6 +177,10 @@ class QuoteResolve:
     topic: str
     handle: str
     target: str
+    is_bot_reply: bool = False
+    is_bystander_quote: bool = False
+    is_stale_quote: bool = False
+    time_delta: float = 0.0
 
 
 def _fmt_hm(ts: int) -> str:
@@ -111,22 +200,17 @@ def _fmt_ago(age_seconds: float) -> str:
     return f"{minutes} 分钟前"
 
 
-# 与 send 路径的 @数字 对齐，并收带数字的平台 ID。纯单词 @the 不是接收人。
-_AT_ID_RE = re.compile(r"@([0-9A-Za-z][0-9A-Za-z_\-]{2,64})")
-
-
 def proactive_directed_target(event: Event, message: str) -> str:
-    """群播报只有正文里的 @用户ID 才算定向。
+    """群播报只有正文里的 <@用户ID> 才算定向。裸 @ 不算。
 
     没有点名时不要把 Event.user_id 写成接收人，否则下一条别人的话会被记成发给这个人。
     """
     if event.group_id:
-        matched = _AT_ID_RE.search(message or "")
-        if matched is None:
-            return ""
-        token = matched.group(1)
-        if any(ch.isdigit() for ch in token):
-            return token
+        rewritten = rewrite_cq_at(message or "")
+        for match in iter_mentions(rewritten):
+            token = normalize_mention_token(match.group(1))
+            if is_mention_id(token):
+                return token
         return ""
     return str(event.user_id) if event.user_id else ""
 
@@ -156,12 +240,21 @@ async def record_outbound(
     sid = session_id or (ev.session_id if ev is not None else "")
     owner = str(ev.user_id) if ev is not None and ev.user_id else target_user
     handles = (image_id or "").strip()
-    topic_s = (topic or "").strip()[:12]
+    topic_s = _clean_topic_head(topic, 12)
+    if not topic_s and handles.startswith("res_"):
+        from gsuid_core.ai_core.planning.models import AIAgentArtifact
+
+        try:
+            art = await AIAgentArtifact.get_by_id(handles)
+        except (OperationalError, ProgrammingError):
+            art = None
+        if art is not None and art.summary:
+            topic_s = _clean_topic_head(art.summary, 12)
     if not topic_s:
         from gsuid_core.ai_core.configs.ai_config import ai_config
 
         n = int(ai_config.get_config("outbound_topic_n").data)
-        topic_s = (text or "").strip().replace("\n", " ")[:n]
+        topic_s = _clean_topic_head((text or "").replace("\n", " "), n)
     try:
         await OutboundAudit.record(
             session_id=sid,
@@ -205,17 +298,160 @@ async def record_outbound(
         logger.debug(i18n_t("log.ai.outbound_purge_skip", e=e))
 
 
+def inspect_quote_relation(ev: Event) -> tuple[bool | None, bool, bool]:
+    """检查当前事件引用的消息与 Bot、当前说话人的物理关系（100% 结构化事实源）。
+
+    返回: (is_reply_to_bot, is_bystander_quote, is_stale_quote)
+    - is_reply_to_bot: True=引用了Bot，False=引用了非Bot(自己或他人)，None=未引用或无记录
+    - is_bystander_quote: 当引用Bot时，当前发言者是否不是原受件人（他人围观借楼）
+    - is_stale_quote: 当引用Bot时，距离原消息发送时间是否已超 180 秒（翻旧账借楼）
+    """
+    reply_id = (ev.reply_id or "").strip()
+    if not reply_id:
+        return None, False, False
+
+    from gsuid_core.message_history import get_history_manager
+
+    rec = get_history_manager().find_by_msg_id(ev, reply_id)
+    if rec is None:
+        return None, False, False
+
+    bot_self_id = str(ev.bot_self_id or "")
+    is_bot = (rec.role == "assistant") or (bool(bot_self_id) and str(rec.user_id) == bot_self_id)
+    if not is_bot:
+        return False, False, False
+
+    meta = rec.metadata or {}
+    reply_to_uid = str(meta["reply_to_user_id"]) if "reply_to_user_id" in meta else ""
+    cur_uid = str(ev.user_id or "")
+    is_bystander = bool(reply_to_uid and cur_uid and reply_to_uid != cur_uid)
+    time_delta = max(0.0, time.time() - rec.timestamp)
+    is_stale = time_delta > 180.0
+    return True, is_bystander, is_stale
+
+
 async def resolve_quote(ev: Event) -> Optional[QuoteResolve]:
     raw = (ev.reply or "").strip()
-    if not raw:
+    reply_id = (ev.reply_id or "").strip()
+    is_image_quote = bool(
+        (reply_id or ev.is_tome) and (not raw or raw.startswith("[图片")) and (ev.image_id_list or ev.image)
+    )
+    if not raw and not is_image_quote and not reply_id:
         return None
+
+    from gsuid_core.message_history import get_history_manager
+    from gsuid_core.ai_core.control.lines import (
+        quote_bot_line,
+        quote_self_line,
+        quote_other_line,
+        quote_stale_line,
+        quote_object_line,
+        quote_bystander_line,
+        quote_command_card_line,
+    )
+
+    # 1. 优先通过 reply_id 在 A 轨历史中按平台 msg_id 精确查找
+    if reply_id:
+        rec = get_history_manager().find_by_msg_id(ev, reply_id)
+        if rec is not None:
+            time_str = datetime.fromtimestamp(rec.timestamp).strftime("%H:%M:%S")
+            time_delta = max(0.0, time.time() - rec.timestamp)
+            bot_self_id = str(ev.bot_self_id or "")
+            is_self_echo = bool(bot_self_id) and str(rec.user_id) == bot_self_id
+            if rec.role == "assistant" or is_self_echo:
+                meta = rec.metadata or {}
+                channel = meta["speech_channel"] if "speech_channel" in meta else None
+                reply_to_uid = str(meta["reply_to_user_id"]) if "reply_to_user_id" in meta else ""
+                reply_to_uname = str(meta["reply_to_user_name"]) if "reply_to_user_name" in meta else ""
+                is_bystander = bool(reply_to_uid and ev.user_id and reply_to_uid != str(ev.user_id))
+                is_stale = time_delta > 180.0
+                target_desc = reply_to_uname or (f"用户{reply_to_uid}" if reply_to_uid else "群内")
+                if channel == "command":
+                    return QuoteResolve(
+                        line=quote_command_card_line(time_str),
+                        topic="命令卡片",
+                        handle="",
+                        target="群内",
+                        is_bot_reply=True,
+                        is_bystander_quote=is_bystander,
+                        is_stale_quote=is_stale,
+                        time_delta=time_delta,
+                    )
+                gid = ledger_group_key(ev)
+                hit = None
+                if _db_ready() and gid:
+                    from sqlalchemy.exc import OperationalError, ProgrammingError
+
+                    from gsuid_core.ai_core.database.outbound import OutboundAudit
+
+                    try:
+                        if raw and not raw.startswith("[图片"):
+                            hit = await OutboundAudit.match_by_text(group_id=gid, text=raw)
+                    except (OperationalError, ProgrammingError) as e:
+                        logger.debug(i18n_t("log.ai.outbound_read_skip", e=e))
+                if hit is not None:
+                    who = hit.target_name or hit.target_user or "对方"
+                    topic = _clean_topic_head(hit.topic or hit.text, 12) or "图片"
+                    handle = (hit.image_handles or "").split(",", 1)[0].strip()
+                    extra = f"，句柄 {handle}" if handle else ""
+                    line = quote_object_line(_fmt_hm(hit.ts), who, topic, extra)
+                    return QuoteResolve(
+                        line=line,
+                        topic=topic,
+                        handle=handle,
+                        target=who,
+                        is_bot_reply=True,
+                        is_bystander_quote=is_bystander,
+                        is_stale_quote=is_stale,
+                        time_delta=time_delta,
+                    )
+                if is_bystander:
+                    line = quote_bystander_line(time_str, target_desc)
+                elif is_stale:
+                    line = quote_stale_line(time_str, int(time_delta // 60))
+                else:
+                    line = quote_bot_line(time_str)
+                return QuoteResolve(
+                    line=line,
+                    topic="你的发言",
+                    handle="",
+                    target=target_desc,
+                    is_bot_reply=True,
+                    is_bystander_quote=is_bystander,
+                    is_stale_quote=is_stale,
+                    time_delta=time_delta,
+                )
+            elif rec.role == "user":
+                if str(rec.user_id) == str(ev.user_id):
+                    return QuoteResolve(
+                        line=quote_self_line(time_str),
+                        topic="说话人自己的发言",
+                        handle="",
+                        target="当前说话人",
+                        is_bot_reply=False,
+                    )
+                else:
+                    speaker = rec.user_name or f"用户{rec.user_id}"
+                    return QuoteResolve(
+                        line=quote_other_line(speaker, time_str),
+                        topic="群友发言",
+                        handle="",
+                        target=speaker,
+                        is_bot_reply=False,
+                    )
+
+    # 2. 兜底：A 轨未查到 msg_id 时，仅对有正文文本做 OutboundAudit 匹配（禁止全群盲抓图片）
+    if not _db_ready():
+        return None
+    gid = ledger_group_key(ev)
+    if not gid or not raw or raw.startswith("[图片"):
+        return None
+
     from sqlalchemy.exc import OperationalError, ProgrammingError
 
     from gsuid_core.ai_core.database.outbound import OutboundAudit
 
-    if not _db_ready():
-        return None
-    gid = ledger_group_key(ev)
+    hit = None
     try:
         hit = await OutboundAudit.match_by_text(group_id=gid, text=raw)
     except (OperationalError, ProgrammingError) as e:
@@ -224,11 +460,13 @@ async def resolve_quote(ev: Event) -> Optional[QuoteResolve]:
     if hit is None:
         return None
     who = hit.target_name or hit.target_user or "对方"
-    topic = hit.topic or "图片"
+    topic = _clean_topic_head(hit.topic or hit.text, 12) or "图片"
     handle = (hit.image_handles or "").split(",", 1)[0].strip()
     extra = f"，句柄 {handle}" if handle else ""
-    line = f"（系统：引用对象：你于 {_fmt_hm(hit.ts)} 发给{who}的「{topic}」{extra}）"
-    return QuoteResolve(line=line, topic=topic, handle=handle, target=who)
+    from gsuid_core.ai_core.control.lines import quote_object_line
+
+    line = quote_object_line(_fmt_hm(hit.ts), who, topic, extra)
+    return QuoteResolve(line=line, topic=topic, handle=handle, target=who, is_bot_reply=True)
 
 
 async def ownership_hint(ev: Event) -> str:
@@ -262,8 +500,10 @@ async def ownership_hint(ev: Event) -> str:
     if age > OWNERSHIP_HINT_TTL_SECONDS:
         return ""
     who = last.target_name or last.target_user
-    topic = last.topic or "图片"
-    return f"（系统：{_fmt_ago(age)}你把「{topic}」发给了{who}。）"
+    topic = _clean_topic_head(last.topic or last.text, 12) or "图片"
+    from gsuid_core.ai_core.control.lines import ownership_line
+
+    return ownership_line(_fmt_ago(age), topic, who)
 
 
 @dataclass(frozen=True)
@@ -376,12 +616,13 @@ async def write_decision_memo(
     ref: str = "",
     handle: str = "",
     owner_user_id: str = "",
+    persona_name: str = "",
 ) -> None:
     """决策点即写。零 LLM，memo ≤60 字，7 天 TTL。"""
     body = " ".join((text or "").split())[:60]
     if not body:
         return
-    from gsuid_core.ai_core.memory.scope import ScopeType, make_scope_key
+    from gsuid_core.ai_core.memory.scope import self_scope_key
     from gsuid_core.ai_core.cognition.nodes import AICogNode
     from gsuid_core.ai_core.cognition.types import CogKind
     from gsuid_core.ai_core.cognition.remember import MemoryWrite, remember
@@ -397,7 +638,7 @@ async def write_decision_memo(
             MemoryWrite(
                 kind=CogKind.SELF_NOTE,
                 ref=key,
-                scope_key=make_scope_key(ScopeType.SELF, bid),
+                scope_key=self_scope_key(bid, persona_name),
                 owner_user_id=owner_user_id,
                 title="决策备忘",
                 summary=body,

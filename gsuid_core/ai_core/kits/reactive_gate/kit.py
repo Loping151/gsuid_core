@@ -21,8 +21,11 @@ class ReactiveGateKit(AgentKit):
 
         if ctx.ev is None or not ctx.soft_triggered:
             return None
-        history = ctx.gate_history
-        allowed = await run_reactive_gate(ctx.ev, list(history), ctx.persona_name)
+        # 前置路由器已经判过「该不该接话」：O(1) 消费，省掉第二次旁路分类调用。
+        if ctx.route_decision is not None:
+            allowed = ctx.route_decision.soft_speak
+        else:
+            allowed = await run_reactive_gate(ctx.ev, list(ctx.gate_history), ctx.persona_name)
         ctx.set_should_speak(bool(allowed))
         if not allowed:
             logger.info(t("log.ai.gscore_soft_trigger_silent"))
@@ -31,10 +34,10 @@ class ReactiveGateKit(AgentKit):
         return None
 
     async def inject_note(self, ctx: AgentHookContext) -> None:
-        from gsuid_core.ai_core.context_assembly import SOFT_TRIGGER_NOTE
-
         if ctx.soft_triggered:
-            ctx.set_context_block("soft_trigger", SOFT_TRIGGER_NOTE)
+            from gsuid_core.ai_core.prompt_group.store import render_prompt
+
+            ctx.set_context_block("soft_trigger", render_prompt(ctx.persona_name, "soft_trigger"))
 
 
 KIT = register_agent_kit(

@@ -31,7 +31,7 @@ python -m gsuid_core.core
 
 ## 3.1 命令行参数
 
-源码 [`gsuid_core/core.py`](../../../gsuid_core/core.py) 的 `main()` 支持：
+源码 [`gsuid_core/core.py`](../../../gsuid_core/core.py) 的 `serve()` 支持（守护父进程原样转交这些参数）：
 
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
@@ -165,14 +165,19 @@ environment=PYTHONUNBUFFERED=1
 
 | 命令 | 行为 |
 |------|------|
-| `core重启` | 先保存 `global_val` → 触发 `restart_command`（默认 `uv run python`，可改） → 拉起新进程 |
+| `core重启` | 跑完关机钩子后退出，守护父进程原地拉起新的 core（网页控制台的「重启」相同） |
 | `gs关闭Core` | 保存状态后 `os._exit(0)`（依赖 systemd / Docker `--restart always` 自动拉起） |
 
 > `core重启` 默认行为：
 >
-> - 不依赖 Docker / systemd；
-> - 当前进程退出后由 Core 内置 `_restart` 协程拉起新进程；
-> - **Windows 下需确保父进程不死**（推荐 NSSM / Docker）。
+> - `core` 启动后有两个进程：守护父进程，和它拉起的 core 子进程。父进程一直是终端的
+>   前台任务，所以重启之后在终端按 Ctrl+C 仍能关掉 core。
+> - 不依赖 Docker / systemd。Docker 里重启不会让容器退出。
+> - 用 `uv run core` 启动时，守护父进程在拉起新 core 之前先执行一次
+>   `uv sync --inexact --no-install-project`。`core更新` 拉到的新依赖在这一步装上。
+>   用 `python -m gsuid_core.core`、`pdm run`、`poetry run` 启动时不做这一步。
+> - 打开 `is_use_custom_restart_command` 后，`core重启` 改为杀掉当前进程，再执行
+>   `restart_command`。用 pm2 / systemd 托管、想让托管程序接手重启时才需要打开。
 
 源码位置：
 - `gsuid_core/buildin_plugins/core_command/core_restart/__init__.py`

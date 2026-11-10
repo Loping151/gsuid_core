@@ -77,7 +77,7 @@ async def _fetch(scope: str, state_key: str) -> Optional[AIPersistentState]:
 
         # 过期删除才占写闸门。没命中的读取不挡其它写。
         if record.expire_at is not None and record.expire_at < _now():
-            async with sqlite_gated_write():
+            async with sqlite_gated_write("AIPersistentState.expire_delete"):
                 await session.execute(delete(AIPersistentState).where(col(AIPersistentState.id) == record.id))
                 await session.commit()
             logger.debug(t("log.ai.state_expired_cleaned_scope", scope=scope, state_key=state_key))
@@ -212,6 +212,22 @@ async def state_list_keys(scope: str, prefix: str = "") -> List[str]:
             continue
         keys.append(record.state_key)
     return keys
+
+
+async def state_list_scopes_with_key(state_key: str, scope_prefix: str = "") -> List[str]:
+    """列出所有含 ``state_key`` 的 scope（可按前缀过滤），跳过已过期行。启动迁移用。"""
+    from gsuid_core.utils.database.base_models import async_maker
+
+    await _ensure_table()
+
+    async with async_maker() as session:
+        stmt = select(AIPersistentState).where(AIPersistentState.state_key == state_key)
+        if scope_prefix:
+            stmt = stmt.where(col(AIPersistentState.scope).startswith(scope_prefix))
+        records = (await session.execute(stmt)).scalars().all()
+
+    now = _now()
+    return [record.scope for record in records if record.expire_at is None or record.expire_at >= now]
 
 
 async def state_mutate(

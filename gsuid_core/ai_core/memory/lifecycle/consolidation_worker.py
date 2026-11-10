@@ -17,16 +17,26 @@
 from gsuid_core.i18n import t as i18n_t
 from gsuid_core.logger import logger
 
-# 衰减判定：超过此天数未被检索则衰减
+# 衰减判定与分层参数（§6.2）
+# group: 域（群 lore/闲聊）
+DECAY_STALE_DAYS_GROUP = 7
+DECAY_FACTOR_GROUP = 0.8
+FORGET_THRESHOLD_GROUP = 0.2
+
+# user_global: 域（用户自述/属性）
+DECAY_STALE_DAYS_USER = 14
+DECAY_FACTOR_USER = 0.85
+FORGET_THRESHOLD_USER = 0.1
+
+# 兼容默认
 DECAY_STALE_DAYS = 14
-# 单次衰减系数
 DECAY_FACTOR = 0.85
-# 高频提及保护阈值：mention_count ≥ 此值的 Edge 不被衰减
-PROTECT_MENTION_COUNT = 3
-# 遗忘阈值：decay_score 低于此值的 Edge 物理删除
 FORGET_THRESHOLD = 0.1
-# 孤儿实体回收 TTL：非 speaker、无 edge、超过此天数未更新的实体被物理删除
-ORPHAN_ENTITY_TTL_DAYS = 10
+
+# 高频提及保护阈值：mention_count ≥ 此值的 Edge 不被衰减（≥2 巩固保护）
+PROTECT_MENTION_COUNT = 2
+# 孤儿实体回收 TTL：非 speaker、无 edge、超过此天数未更新的实体被物理删除（TTL 10 -> 3 天）
+ORPHAN_ENTITY_TTL_DAYS = 3
 
 # ── §3.2① Episode 保留策略 / 冷热分集合 ──────────────────────
 # 最近 EPISODE_HOT_DAYS 天内的 Episode 始终保留为热（不降级）
@@ -71,13 +81,12 @@ async def _consolidate() -> int:
     return count
 
 
-async def _forget() -> int:
-    """遗忘：物理删除 decay_score 低于阈值的 Edge（SQL + Qdrant 向量）。"""
-    from gsuid_core.ai_core.memory.database.models import AIMemEdge
-
-    forgotten_ids = await AIMemEdge.collect_forgotten(threshold=FORGET_THRESHOLD)
+async def _forget_ids(forgotten_ids: list[str]) -> int:
+    """遗忘：物理删除指定的 Edge（SQL + Qdrant 向量）。"""
     if not forgotten_ids:
         return 0
+
+    from gsuid_core.ai_core.memory.database.models import AIMemEdge
 
     await AIMemEdge.purge_by_ids(forgotten_ids)
 
@@ -100,21 +109,23 @@ async def _forget() -> int:
     return len(forgotten_ids)
 
 
-async def _purge_entities(victims: list[tuple[str, str, str]]) -> int:
-    """物理删除一批实体（``(id, scope_key, qdrant_id)``）：分块删 SQL（实体 + 关联表）
-    → 删 Qdrant 实体向量 → 按 scope 递减分层图 current_entity_count。
+async def _forget() -> int:
+    """遗忘：按分层规则物理删除 decay_score 低于阈值的 Edge（SQL + Qdrant 向量）。"""
+    from gsuid_core.ai_core.memory.database.models import AIMemEdge
 
-    供"孤儿 GC"与"容量裁剪"共用。current_entity_count 在下次重建时会被 _update_meta 以
-    COUNT(*) 精确校正，故此处递减只为保持两次重建之间触发计数不虚高。返回回收数量。
-    """
+    # 分层收集：群闲聊域阈值 0.2，其余通用域阈值 0.1（两步查询覆盖全表）
+    group_ids = await AIMemEdge.collect_forgotten(threshold=FORGET_THRESHOLD_GROUP, scope_prefix="group:")
+    base_ids = await AIMemEdge.collect_forgotten(threshold=FORGET_THRESHOLD)
+    all_forgotten = list(set(group_ids + base_ids))
+    return await _forget_ids(all_forgotten)
+
+
+async def _purge_entities(victims: list[tuple[str, str, str]]) -> int:
+    """物理删除一批实体（``(id, scope_key, qdrant_id)``）：分块删 SQL 与 Qdrant 向量。"""
     if not victims:
         return 0
 
-    from collections import Counter
-
     from gsuid_core.ai_core.memory.database.models import AIMemEntity
-
-    scope_counts = Counter(o[1] for o in victims)
 
     # 分块处理：积压海量实体时，一次性 IN(...) 删除会触碰 SQLite 变量上限、且单次 Qdrant
     # 删除点数过多易超时，故按 CHUNK 切批，逐批 SQL + 向量删除。
@@ -145,27 +156,6 @@ async def _purge_entities(victims: list[tuple[str, str, str]]) -> int:
             logger.warning(i18n_t("log.memory.lifecycle_delete_qdrant_entity_fail", e=e))
 
         total += len(entity_ids)
-
-    # 按 scope 递减分层图实体计数
-    try:
-        from sqlmodel import col
-        from sqlalchemy import update as _update
-
-        from gsuid_core.utils.database.base_models import async_maker
-        from gsuid_core.ai_core.memory.ingestion.hiergraph import AIMemHierarchicalGraphMeta
-        from gsuid_core.ai_core.memory.ingestion.eval_write_lock import db_write_guard
-
-        async with db_write_guard(), async_maker() as session:
-            for scope_key, cnt in scope_counts.items():
-                await session.execute(
-                    _update(AIMemHierarchicalGraphMeta)
-                    .where(col(AIMemHierarchicalGraphMeta.scope_key) == scope_key)
-                    .values(current_entity_count=AIMemHierarchicalGraphMeta.current_entity_count - cnt)
-                )
-            await session.commit()
-    except Exception as e:
-        logger.warning(i18n_t("log.memory.lifecycle_decrement_hierarchical_graph_fail", e=e))
-
     return total
 
 
@@ -213,50 +203,41 @@ async def _trim_entity_capacity() -> int:
 
 
 async def _retain_episodes() -> tuple[int, int]:
-    """§3.2① Episode 保留策略 + 冷热分集合（填 P0-2 最大窟窿）。
+    """每 scope Episode 物理上限：删除最老且无 Entity 引用的片段。
 
-    ① **降级（热→冷）**：把"无 Entity 引用 + 超龄 + 超每 scope 最近 M 条"的热 Episode
-       向量迁到冷集合并从热集合删除、SQL 标记 is_archived——退出 System-1 在线检索、
-       钉住热集合规模（直接缓解 P0-1 暴力扫描），SQL 文本仍可审计。
-    ② **物理上限**：每 scope 总量超 EPISODE_MAX_PER_SCOPE 时，物理删除最老的
-       "冷且无引用"Episode（SQL + 热/冷向量），把 SQL 体量也钉在可控范围。
-
-    返回 ``(降级数, 物理删除数)``。
+    schema_v2 已移除冷热分集合，``demoted`` 恒为 0；``purged`` 为物理删除数。
     """
-    from gsuid_core.ai_core.memory.vector.ops import delete_points_by_ids, demote_episodes_to_cold
+    from sqlmodel import col, func, select
+
+    from gsuid_core.ai_core.memory.vector.ops import delete_points_by_ids
+    from gsuid_core.utils.database.base_models import async_maker
     from gsuid_core.ai_core.memory.database.models import AIMemEpisode
-    from gsuid_core.ai_core.memory.vector.collections import (
-        MEMORY_EPISODES_COLLECTION,
-        MEMORY_EPISODES_COLD_COLLECTION,
-    )
+    from gsuid_core.ai_core.memory.vector.collections import MEMORY_EPISODES_COLLECTION
 
-    # ① 降级：先迁移/删热向量，再按"已成功退出热集合"的 id 回写 is_archived
-    to_demote = await AIMemEpisode.collect_episodes_to_demote(
-        hot_days=EPISODE_HOT_DAYS,
-        hot_per_scope=EPISODE_HOT_PER_SCOPE,
-    )
-    demoted = 0
-    if to_demote:
-        evicted = await demote_episodes_to_cold([t[0] for t in to_demote])
-        if evicted:
-            await AIMemEpisode.mark_archived_by_ids(evicted)
-            demoted = len(evicted)
-
-    # ② 每 scope 物理上限：删冷且无引用的最老 Episode（SQL + 热/冷两侧向量兜底删除）
-    overflow = await AIMemEpisode.collect_episode_overflow(max_per_scope=EPISODE_MAX_PER_SCOPE)
     purged = 0
-    if overflow:
-        CHUNK = 500
-        for i in range(0, len(overflow), CHUNK):
-            batch = overflow[i : i + CHUNK]
-            ids = [t[0] for t in batch]
-            qids = [t[1] for t in batch]
+    async with async_maker() as session:
+        over = await session.execute(
+            select(AIMemEpisode.scope_key, func.count())
+            .group_by(AIMemEpisode.scope_key)
+            .having(func.count() > EPISODE_MAX_PER_SCOPE)
+        )
+        scopes = [(row[0], int(row[1])) for row in over.all()]
+        for scope_key, count in scopes:
+            to_remove = count - EPISODE_MAX_PER_SCOPE
+            rows = await session.execute(
+                select(AIMemEpisode.id, AIMemEpisode.qdrant_id)
+                .where(AIMemEpisode.scope_key == scope_key)
+                .order_by(col(AIMemEpisode.valid_at).asc())
+                .limit(to_remove)
+            )
+            victims = [(row[0], row[1]) for row in rows.all()]
+            if not victims:
+                continue
+            ids = [v[0] for v in victims]
             await AIMemEpisode.purge_episodes_by_ids(ids)
-            await delete_points_by_ids(MEMORY_EPISODES_COLLECTION, qids)
-            await delete_points_by_ids(MEMORY_EPISODES_COLD_COLLECTION, qids)
+            await delete_points_by_ids(MEMORY_EPISODES_COLLECTION, [v[1] for v in victims])
             purged += len(ids)
-
-    return demoted, purged
+    return 0, purged
 
 
 async def _filter_existing_qdrant_ids(model, ids: list[str]) -> set[str]:
@@ -282,17 +263,17 @@ async def _reconcile_dangling_vectors() -> int:
     from gsuid_core.ai_core.memory.database.models import AIMemEdge, AIMemEntity, AIMemEpisode
     from gsuid_core.ai_core.memory.vector.collections import (
         MEMORY_EDGES_COLLECTION,
+        MEMORY_THREADS_COLLECTION,
         MEMORY_ENTITIES_COLLECTION,
         MEMORY_EPISODES_COLLECTION,
-        MEMORY_EPISODES_COLD_COLLECTION,
     )
 
     targets = [
         (MEMORY_EPISODES_COLLECTION, AIMemEpisode),
-        (MEMORY_EPISODES_COLD_COLLECTION, AIMemEpisode),
         (MEMORY_ENTITIES_COLLECTION, AIMemEntity),
         (MEMORY_EDGES_COLLECTION, AIMemEdge),
     ]
+    _ = MEMORY_THREADS_COLLECTION
 
     total = 0
     for collection, model in targets:
@@ -353,11 +334,26 @@ async def run_lifecycle_maintenance() -> None:
         slept = await run_sleep_extract_tick()
         logger.info(i18n_t("log.memory.lifecycle_sleep_extract", n=slept))
         consolidated = await _consolidate()
-        decayed = await AIMemEdge.apply_decay(
-            stale_days=DECAY_STALE_DAYS,
-            decay_factor=DECAY_FACTOR,
+        # 分层衰减（§6.2）：群 lore 7天/0.8；用户自报 14天/0.85
+        decayed_group = await AIMemEdge.apply_decay(
+            stale_days=DECAY_STALE_DAYS_GROUP,
+            decay_factor=DECAY_FACTOR_GROUP,
             protect_mention_count=PROTECT_MENTION_COUNT,
+            scope_prefix="group:",
         )
+        decayed_user = await AIMemEdge.apply_decay(
+            stale_days=DECAY_STALE_DAYS_USER,
+            decay_factor=DECAY_FACTOR_USER,
+            protect_mention_count=PROTECT_MENTION_COUNT,
+            scope_prefix="user_global:",
+        )
+        decayed_user_in_group = await AIMemEdge.apply_decay(
+            stale_days=DECAY_STALE_DAYS_USER,
+            decay_factor=DECAY_FACTOR_USER,
+            protect_mention_count=PROTECT_MENTION_COUNT,
+            scope_prefix="user_in_group:",
+        )
+        decayed = decayed_group + decayed_user + decayed_user_in_group
         forgotten = await _forget()
         # §3.2③ Edge 容量裁剪放在遗忘之后：先按 decay 遗忘弱边，再对仍超软上限的 scope 削长尾
         edge_trimmed = await _trim_edge_capacity()

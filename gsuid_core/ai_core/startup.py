@@ -16,6 +16,7 @@
 
 import time
 import asyncio
+from enum import StrEnum
 from typing import Optional
 
 # 必须在此导入关系温度表迁移模块，确保在 @on_core_start_before 阻塞阶段执行。
@@ -47,6 +48,12 @@ async def _init_persona():
     await init_default_personas()
 
 
+async def _init_persona_scope_migration():
+    from gsuid_core.ai_core.migrations.persona_scope_v1 import migrate_legacy_persona_scopes
+
+    await migrate_legacy_persona_scopes()
+
+
 async def _init_scheduled_task():
     from gsuid_core.ai_core.scheduled_task.startup import init_scheduled_tasks
 
@@ -54,10 +61,23 @@ async def _init_scheduled_task():
 
 
 async def _init_approval():
-    from gsuid_core.ai_core.approval import prime_pending, register_builtin_categories
+    from gsuid_core.aps import scheduler
+    from gsuid_core.ai_core.approval import expire_due, prime_pending, register_builtin_categories
 
     register_builtin_categories()
     await prime_pending()
+
+    async def _expire_job() -> None:
+        await expire_due()
+
+    scheduler.add_job(
+        func=_expire_job,
+        trigger="interval",
+        seconds=30,
+        id="approval_expire_due",
+        name="审批确认码过期",
+        replace_existing=True,
+    )
 
 
 async def _init_planning():
@@ -73,6 +93,7 @@ async def _init_memory():
 
 
 async def _init_mcp_tools():
+    from gsuid_core.ai_core.mcp import bind_command as _mcp_bind_command  # noqa: F401
     from gsuid_core.ai_core.mcp.startup import init_mcp_tools
 
     await init_mcp_tools()
@@ -88,6 +109,12 @@ async def _init_statistics():
     from gsuid_core.ai_core.statistics.startup import init_ai_core_statistics
 
     await init_ai_core_statistics()
+
+
+async def _init_autonomy() -> None:
+    from gsuid_core.ai_core.autonomy.startup import init_autonomy
+
+    await init_autonomy()
 
 
 async def _init_mcp_server():
@@ -151,8 +178,18 @@ async def _init_command_exec():
     await init_command_exec()
 
 
+class AICoreInitPhase(StrEnum):
+    IDLE = "idle"
+    INITIALIZING = "initializing"
+    READY = "ready"
+    DEGRADED = "degraded"
+    DISABLED = "disabled"
+    FAILED = "failed"
+
+
 _AI_CORE_READY = False
 _AI_CORE_INITIALIZING = False
+_AI_CORE_PHASE: AICoreInitPhase = AICoreInitPhase.IDLE
 _AI_CORE_READY_EVENT: Optional[asyncio.Event] = None
 
 
@@ -161,6 +198,23 @@ def _get_ready_event() -> asyncio.Event:
     if _AI_CORE_READY_EVENT is None:
         _AI_CORE_READY_EVENT = asyncio.Event()
     return _AI_CORE_READY_EVENT
+
+
+def get_ai_core_init_phase() -> AICoreInitPhase:
+    """返回 AI 核心当前生命周期阶段。"""
+    if _AI_CORE_INITIALIZING:
+        return AICoreInitPhase.INITIALIZING
+    if not _AI_CORE_READY:
+        if _AI_CORE_PHASE == AICoreInitPhase.FAILED:
+            return AICoreInitPhase.FAILED
+        return AICoreInitPhase.IDLE
+    if _AI_CORE_PHASE in (
+        AICoreInitPhase.READY,
+        AICoreInitPhase.DEGRADED,
+        AICoreInitPhase.DISABLED,
+    ):
+        return _AI_CORE_PHASE
+    return AICoreInitPhase.READY
 
 
 def is_ai_core_ready() -> bool:
@@ -192,6 +246,7 @@ _INIT_STEPS = [
     ("Agent 套件", _init_agent_kits),
     ("RAG", _init_rag),
     ("Persona", _init_persona),
+    ("多人格隔离迁移", _init_persona_scope_migration),
     ("审批中心", _init_approval),
     ("定时任务", _init_scheduled_task),
     ("长任务编排", _init_planning),
@@ -199,6 +254,7 @@ _INIT_STEPS = [
     ("MCP 工具", _init_mcp_tools),
     ("Meme", _init_meme),
     ("统计", _init_statistics),
+    ("自主行动", _init_autonomy),
     ("MCP Server", _init_mcp_server),
     ("命令执行", _init_command_exec),
 ]
@@ -207,7 +263,7 @@ _INIT_STEPS = [
 @on_core_start
 async def init_ai_core():
     """AI 核心统一初始化（后台执行，不阻塞 WS 启动）。"""
-    global _AI_CORE_READY, _AI_CORE_INITIALIZING
+    global _AI_CORE_READY, _AI_CORE_INITIALIZING, _AI_CORE_PHASE
 
     # 防并发初始化：状态判断与 _AI_CORE_INITIALIZING 之间无 await，保证原子置位。
     # 避免双流水线并发写 Qdrant 产生文件锁冲突。
@@ -221,12 +277,14 @@ async def init_ai_core():
     if not enable_ai:
         _AI_CORE_READY = True
         _AI_CORE_INITIALIZING = False
+        _AI_CORE_PHASE = AICoreInitPhase.DISABLED
         _get_ready_event().set()
         logger.info(t("log.ai.core_init_skip_import_ai_master"))
         return
 
     _AI_CORE_READY = False
     _AI_CORE_INITIALIZING = True
+    _AI_CORE_PHASE = AICoreInitPhase.INITIALIZING
     _get_ready_event().clear()
     start = time.time()
     logger.info(t("log.ai.ai_core_background_initialization_start"))
@@ -239,6 +297,7 @@ async def init_ai_core():
     except Exception as e:
         logger.exception(t("log.ai.core_init_fail_import_ai_heavy", e=e))
         _AI_CORE_INITIALIZING = False
+        _AI_CORE_PHASE = AICoreInitPhase.FAILED
         _get_ready_event().set()
         return
 
@@ -281,6 +340,7 @@ async def init_ai_core():
     finally:
         _AI_CORE_READY = True
         _AI_CORE_INITIALIZING = False
+        _AI_CORE_PHASE = AICoreInitPhase.DEGRADED if init_failed else AICoreInitPhase.READY
         _get_ready_event().set()
         # 挂载不进 _INIT_STEPS：READY 之后后台跑，失败不得把就绪改回 false。
         try:

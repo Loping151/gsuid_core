@@ -131,6 +131,7 @@ async def search_cognition(
     kinds: FrozenSet[CogKind],
     scope: CogScope,
     limit: int = 24,
+    memory_intent: str = "point_latest",
 ) -> List[CognitiveHit]:
     """联邦检索认知层。``kinds`` 与 ``scope`` **必填、无内部兜底**（见 types 模块 docstring）。
 
@@ -150,6 +151,7 @@ async def search_cognition(
                     kinds=kinds,
                     scope=scope,
                     limit=limit,
+                    memory_intent=memory_intent,
                 )
             )
         )
@@ -207,7 +209,11 @@ async def search_cognition(
         for hid, hit in hits.items():
             confident = hit.score >= backend_floor
             body = hit.summary or hit.title
-            if hit.kind is CogKind.EPISODE and not text_has_query_needles(query, body):
+            if (
+                hit.kind is CogKind.EPISODE
+                and memory_intent not in ("timeline_order", "broad_summary")
+                and not text_has_query_needles(query, body)
+            ):
                 confident = False
             merged[hid] = replace(hit, high_confidence=confident)
 
@@ -390,7 +396,8 @@ async def _expand_time_neighbors(
         if dt is None or not scope_key:
             continue
         try:
-            rows = await AIMemEpisode.neighbors_by_time(scope_key, dt, before=before, after=after)
+            ep_id = str(ep["id"]) if "id" in ep else None
+            rows = await AIMemEpisode.neighbors_by_time(scope_key, dt, before=before, after=after, episode_id=ep_id)
         except (TypeError, RuntimeError) as e:
             # 单测无 async_maker / 库未就绪：保留向量命中，不打断回想
             logger.debug(t("log.ai.cognition_backend_fail", backend="neighbors", e=e))
@@ -421,10 +428,11 @@ async def _search_memory(
     kinds: FrozenSet[CogKind],
     scope: CogScope,
     limit: int,
+    memory_intent: str = "point_latest",
 ) -> _BackendResult:
     from gsuid_core.ai_core.memory.config import memory_config
-    from gsuid_core.ai_core.memory.ingestion.edge import _DANGLING_FACT_RE
     from gsuid_core.ai_core.memory.retrieval.types import Edge, Entity
+    from gsuid_core.ai_core.memory.ingestion.algebra import _DANGLING_FACT_RE
     from gsuid_core.ai_core.memory.retrieval.dual_route import dual_route_retrieve, _fact_mentions_speaker
 
     stripped_speaker = strip_speaker_from_query(query, scope.user_id)
@@ -442,6 +450,9 @@ async def _search_memory(
         bot_id=scope.bot_id,
         bot_self_id=scope.bot_self_id,
         include_self=True,
+        persona_name=scope.persona_name,
+        memory_intent=memory_intent,
+        clock_at=scope.clock_at,
     )
     seed_ep_ids: set[str] = set()
     neighbor_ep_ids: set[str] = set()
@@ -450,9 +461,9 @@ async def _search_memory(
         if ctx.episodes:
             ctx.episodes = await _expand_time_neighbors(
                 ctx.episodes,
-                seed=6,
-                before=4,
-                after=4,
+                seed=8,
+                before=8,
+                after=8,
                 order_by_time=False,
             )
             neighbor_ep_ids = {str(ep["id"]) for ep in ctx.episodes if "id" in ep} - seed_ep_ids
@@ -462,9 +473,9 @@ async def _search_memory(
             user_id=scope.user_id,
             group_id=scope.group_id,
             clock=scope.clock_at,
+            memory_intent=memory_intent,
         )
         from gsuid_core.ai_core.memory.retrieval.lexical import (
-            looks_like_set_query,
             apply_query_episode_pack,
             collapse_document_episodes,
         )
@@ -475,8 +486,9 @@ async def _search_memory(
             temporal_mode=ctx.temporal_mode,
             time_range=ctx.time_range,
             asker_id=scope.user_id if scope.group_id else "",
+            memory_intent=memory_intent,
         )
-        if looks_like_set_query(search_q):
+        if memory_intent == "broad_summary":
             ctx.episodes = collapse_document_episodes(ctx.episodes)
     ids: List[str] = []
     hits: Dict[str, CognitiveHit] = {}
@@ -518,7 +530,9 @@ async def _search_memory(
                 if raw_id and raw_id in neighbor_ep_ids and raw_id not in seed_ep_ids
                 else _EPISODE_SEED_SCORE
             )
-            if not text_has_query_needles(search_q, content):
+            if memory_intent not in ("timeline_order", "broad_summary") and not text_has_query_needles(
+                search_q, content
+            ):
                 ep_score = min(ep_score, 0.2)
             _add(
                 CognitiveHit(
@@ -875,7 +889,7 @@ async def _search_nodes(
     scope: CogScope,
     limit: int,
 ) -> _BackendResult:
-    from gsuid_core.ai_core.memory.scope import ScopeType, make_scope_key
+    from gsuid_core.ai_core.memory.scope import ScopeType, make_scope_key, self_scope_read_keys
     from gsuid_core.ai_core.cognition.nodes import AICogNode
 
     scope_keys: List[str] = []
@@ -883,9 +897,11 @@ async def _search_nodes(
         scope_keys.append(make_scope_key(ScopeType.GROUP, scope.group_id))
     if scope.user_id:
         scope_keys.append(make_scope_key(ScopeType.USER_GLOBAL, scope.user_id))
-    # self_note / 自身发言写在 self:{bot_self_id}；漏这项则写入后永远召不回
+    # self_note / 自身发言写在 self:{bot_self_id}:{persona}；漏这项则写入后永远召不回
     if scope.bot_self_id:
-        scope_keys.append(make_scope_key(ScopeType.SELF, scope.bot_self_id))
+        for key in self_scope_read_keys(scope.bot_self_id, scope.persona_name):
+            if key not in scope_keys:
+                scope_keys.append(key)
     search_q = await _knowledge_query_for_scope(query, scope)
     rows = await AICogNode.search(
         search_q,
@@ -993,13 +1009,13 @@ async def inject_memory_slice(
     priority_speakers: Set[str],
     current_speaker_ids: Set[str],
     preference_contexts: List[str],
+    memory_intent: str = "point_latest",
 ) -> str:
-    """⑧ 每轮自动注入的**记忆+偏好切片**（与工具路径同一入口、同一 scope 纪律）。
+    """⑧ 每轮自动注入的**记忆切片**（与工具路径同一入口、同一 scope 纪律）。
 
     刻意不走 :func:`render_cognition_block`：``to_prompt_text`` 的配额位
-    （偏好独立 ``preference_inject_budget_ratio`` / 事实 / 冲突 / 类目，片段吃剩余）
-    与第三方隐私门（敏感事实仅当事人在场才注入）必须保留——统一成通用渲染会让偏好
-    被事实挤掉，那正是「语义类型保留」不变量要防的事。
+    （事实 / 冲突 / 类目，片段吃剩余）与第三方隐私门（敏感事实仅当事人在场才注入）
+    必须保留；说话人偏好统一由尾部 ``load_speaker_preference_tail`` 归一化去重后输出一次。
 
     总帽只从 :func:`inject_memory_cap` 取：与 H05 注入同一条函数，工具路径不会另抬一档。
 
@@ -1016,19 +1032,23 @@ async def inject_memory_slice(
         top_k=memory_config.retrieval_top_k,
         enable_system2=scope.enable_system2,
         enable_user_global=scope.enable_user_global,
-        inject_preferences=True,
+        inject_preferences=False,
         preference_contexts=preference_contexts,
         bot_id=scope.bot_id,
         bot_self_id=scope.bot_self_id,
         include_self=True,
+        persona_name=scope.persona_name,
+        memory_intent=memory_intent,
+        clock_at=scope.clock_at,
     )
-    cap = inject_memory_cap(query, covered=ctx.covered)
+    cap = inject_memory_cap(query, covered=ctx.covered, memory_intent=memory_intent)
     memory_text = ctx.to_prompt_text(
         max_chars=cap,
         priority_speakers=priority_speakers or None,
         current_speaker_ids=current_speaker_ids or None,
         query=query,
         now=scope.clock_at,
+        memory_intent=memory_intent,
     )
     tool_block = await format_recent_tool_conclusions(query, scope)
     if tool_block:

@@ -5,17 +5,19 @@ Persona APIs
 """
 
 import base64
-from typing import Any, Dict
+from typing import Any, Dict, List, TypedDict
 
 from fastapi import Depends, HTTPException
+from pydantic import BaseModel
 from fastapi.responses import FileResponse
 
+import gsuid_core.webconsole.persona_store_api  # noqa: F401
+import gsuid_core.webconsole.persona_bundle_api  # noqa: F401
 from gsuid_core.ai_core.persona import (
     Persona,
     copy_persona,
     load_persona,
     save_persona,
-    delete_persona,
     get_persona_metadata,
     get_persona_audio_path,
     get_persona_image_path,
@@ -37,9 +39,31 @@ from gsuid_core.ai_core.persona.settings import (
     DEFAULT_PERSONA_SETTINGS,
     persona_settings_manager,
 )
+from gsuid_core.webconsole.session_store import SessionRecord
 from gsuid_core.utils.plugins_config.models import GsDivider
 
 from ._api_tags import PERSONA
+
+
+def _is_builtin_persona(name: str) -> bool:
+    """程序自带的默认人格。启动会用种子覆盖它的正文。"""
+    from gsuid_core.ai_core.prompt_group.catalog import BUILTIN_PERSONA_NAME
+
+    return name == BUILTIN_PERSONA_NAME
+
+
+def _managed_block(persona_name: str) -> Dict[str, Any] | None:
+    """git 人格内容由仓库拥有，只许改启用范围；其余写操作在这里拦下。"""
+    from gsuid_core.ai_core.persona.store import is_git_managed
+
+    if is_git_managed(persona_name):
+        return {
+            "status": 1,
+            "msg": "该人格由人格市场管理，不允许直接修改；可复制一份后编辑副本。",
+            "data": None,
+        }
+    return None
+
 
 # 音频MIME类型映射
 AUDIO_MIME_TYPES = {
@@ -72,6 +96,21 @@ async def get_persona_list(_: Dict[str, Any] = Depends(require_auth)) -> Dict[st
         "msg": "ok",
         "data": personas_data,
     }
+
+
+@app.get(
+    "/api/persona/config/placeholder-preview",
+    summary="已激活人格的标签填入值",
+    tags=PERSONA,
+)
+async def get_placeholder_preview(_: Dict[str, Any] = Depends(require_auth)) -> Dict[str, Any]:
+    """提示词组页只读展示。开关打开、且人格目录还在的才列出。
+
+    不放在 /api/persona/{name}：那个路由先注册，两段路径会被它接走。
+    """
+    from gsuid_core.ai_core.persona.placeholder_preview import active_placeholder_preview
+
+    return {"status": 0, "msg": "ok", "data": active_placeholder_preview()}
 
 
 @app.get("/api/persona/{persona_name}", summary="获取角色详情", tags=PERSONA)
@@ -131,12 +170,22 @@ async def update_persona_content(
         status: 0成功，1失败
         data: 包含 name 和 content 的对象
     """
+    blocked = _managed_block(persona_name)
+    if blocked is not None:
+        return blocked
     content = data.get("content", "")
 
     if not content:
         return {
             "status": 1,
             "msg": "请提供内容",
+            "data": None,
+        }
+
+    if _is_builtin_persona(persona_name):
+        return {
+            "status": 1,
+            "msg": "默认人格「早柚」的人格卡每次启动从程序写回，不能在这里修改。请先复制一份。",
             "data": None,
         }
 
@@ -249,6 +298,9 @@ async def upload_persona_avatar(
         status: 0成功，1失败
         data.path: 头像文件路径
     """
+    blocked = _managed_block(persona_name)
+    if blocked is not None:
+        return blocked
     image_base64 = data.get("image", "")
     if not image_base64:
         return {
@@ -326,6 +378,9 @@ async def upload_persona_image(
         status: 0成功，1失败
         data.path: 立绘文件路径
     """
+    blocked = _managed_block(persona_name)
+    if blocked is not None:
+        return blocked
     image_base64 = data.get("image", "")
     if not image_base64:
         return {
@@ -404,6 +459,9 @@ async def upload_persona_audio(
         status: 0成功，1失败
         data.path: 音频文件路径
     """
+    blocked = _managed_block(persona_name)
+    if blocked is not None:
+        return blocked
     audio_base64 = data.get("audio", "")
     if not audio_base64:
         return {
@@ -492,6 +550,17 @@ async def create_persona(
     name = data.get("name", "").strip()
     query = data.get("query", "").strip()
 
+    blocked = _managed_block(name)
+    if blocked is not None:
+        return blocked
+
+    if _is_builtin_persona(name):
+        return {
+            "status": 1,
+            "msg": "默认人格「早柚」的人格卡每次启动从程序写回，不能在这里修改。请先复制一份。",
+            "data": None,
+        }
+
     if not name:
         return {
             "status": 1,
@@ -545,6 +614,13 @@ async def add_persona(
     """
     name = data.get("name", "").strip()
     content = data.get("content", "").strip()
+
+    if _is_builtin_persona(name):
+        return {
+            "status": 1,
+            "msg": "默认人格「早柚」的人格卡每次启动从程序写回，不能在这里修改。请先复制一份。",
+            "data": None,
+        }
 
     if not name:
         return {
@@ -601,7 +677,7 @@ async def copy_persona_endpoint(
             "data": None,
         }
     try:
-        new_name = copy_persona(persona_name)
+        new_name = await copy_persona(persona_name)
     except ValueError as e:
         return {
             "status": 1,
@@ -634,7 +710,16 @@ async def remove_persona(
     Returns:
         status: 0成功，1失败
     """
-    deleted = delete_persona(persona_name)
+    if _is_builtin_persona(persona_name):
+        return {
+            "status": 1,
+            "msg": "默认人格「早柚」的人格卡每次启动从程序写回，不能删除。",
+            "data": None,
+        }
+    # git 导入的人格删除时连同克隆仓库一起清掉
+    from gsuid_core.ai_core.persona.store import uninstall_git_persona
+
+    deleted, msg = await uninstall_git_persona(persona_name)
     if deleted:
         return {
             "status": 0,
@@ -644,7 +729,7 @@ async def remove_persona(
     else:
         return {
             "status": 1,
-            "msg": f"角色 '{persona_name}' 不存在",
+            "msg": msg or f"角色 '{persona_name}' 不存在",
             "data": None,
         }
 
@@ -713,6 +798,20 @@ async def update_persona_config(
             "data": None,
         }
 
+    # git 人格的行为配置由仓库拥有；启用范围是部署状态，仍然可改
+    from gsuid_core.ai_core.persona.store import LOCAL_OVERRIDE_KEYS, is_git_managed
+
+    if is_git_managed(persona_name):
+        blocked_keys = [k for k in data if k not in LOCAL_OVERRIDE_KEYS]
+        if blocked_keys:
+            allowed = ", ".join(LOCAL_OVERRIDE_KEYS)
+            rejected = ", ".join(sorted(blocked_keys))
+            return {
+                "status": 1,
+                "msg": f"该人格由人格市场管理，仅允许修改 {allowed}；被拒绝的字段: {rejected}",
+                "data": None,
+            }
+
     results = []
 
     # 更新 scope（如果提供）
@@ -768,6 +867,17 @@ async def update_persona_config(
             from gsuid_core.ai_core.heartbeat import start_heartbeat_inspector
 
             start_heartbeat_inspector()
+        if "自主行动" in ai_mode:
+            from gsuid_core.ai_core.autonomy.scheduler import autonomy_scheduler
+
+            await autonomy_scheduler.start()
+
+    # 驱动四参数（如果提供）
+    for _trait_key in ("social_initiative", "energy_endurance", "curiosity_focus", "arc_persistence"):
+        if _trait_key in data:
+            if not persona_config_manager.get_config(persona_name).set_config(_trait_key, data[_trait_key]):
+                return {"status": 1, "msg": f"{_trait_key} 写入失败", "data": None}
+            results.append(f"{_trait_key}: {data[_trait_key]}")
 
     # 更新 inspect_interval（如果提供）
     if "inspect_interval" in data:
@@ -813,6 +923,110 @@ async def update_persona_config(
                 "data": None,
             }
         results.append(f"keywords: {keywords}")
+
+    from gsuid_core.ai_core.persona.config import autonomy_settings_from_mapping
+
+    autonomy_payload: dict[str, object] = {}
+    for autonomy_key in (
+        "active_hours",
+        "timezone",
+        "autonomy_interval_minutes",
+        "autonomy_care_min_zone",
+    ):
+        if autonomy_key in data:
+            autonomy_payload[autonomy_key] = data[autonomy_key]
+    autonomy_settings, autonomy_error = autonomy_settings_from_mapping(autonomy_payload)
+    if autonomy_error:
+        return {"status": 1, "msg": autonomy_error, "data": None}
+    if autonomy_settings is not None:
+        success, msg = persona_config_manager.set_autonomy_settings(persona_name, autonomy_settings)
+        if not success:
+            return {"status": 1, "msg": msg, "data": None}
+        results.append("autonomy")
+
+    aside_fields = (
+        "aside_image_probability",
+        "aside_text_probability",
+        "aside_mixed_probability",
+    )
+    for aside_field in aside_fields:
+        if aside_field not in data:
+            continue
+        raw_probability = data[aside_field]
+        if isinstance(raw_probability, bool) or not isinstance(raw_probability, (int, float)):
+            return {
+                "status": 1,
+                "msg": f"{aside_field} 必须是 0 到 1 的数字",
+                "data": None,
+            }
+        success, msg = persona_config_manager.set_aside_probability(
+            persona_name,
+            aside_field,
+            float(raw_probability),
+        )
+        if not success:
+            return {
+                "status": 1,
+                "msg": msg,
+                "data": None,
+            }
+        results.append(f"{aside_field}: {raw_probability}")
+
+    if "aside_allow_tools" in data:
+        allow_tools = data["aside_allow_tools"]
+        if not isinstance(allow_tools, bool):
+            return {
+                "status": 1,
+                "msg": "aside_allow_tools 必须是布尔值",
+                "data": None,
+            }
+        success, msg = persona_config_manager.set_aside_allow_tools(persona_name, allow_tools)
+        if not success:
+            return {
+                "status": 1,
+                "msg": msg,
+                "data": None,
+            }
+        results.append(f"aside_allow_tools: {allow_tools}")
+
+    # 表情三键同时镜像进 persona.json，保证整包导出时两文件一致
+    if "allow_meme_reply" in data:
+        allow_meme = data["allow_meme_reply"]
+        if not isinstance(allow_meme, bool):
+            return {"status": 1, "msg": "allow_meme_reply 必须是布尔值", "data": None}
+        success, msg = persona_config_manager.set_allow_meme_reply(persona_name, allow_meme)
+        if not success:
+            return {"status": 1, "msg": msg, "data": None}
+        persona_settings_manager.get_config(persona_name).set_config("allow_meme_reply", allow_meme)
+        results.append(f"allow_meme_reply: {allow_meme}")
+
+    if "meme_frequency" in data:
+        raw_freq = data["meme_frequency"]
+        if isinstance(raw_freq, bool):
+            return {"status": 1, "msg": "meme_frequency 必须是整数", "data": None}
+        try:
+            meme_frequency = int(raw_freq)
+        except (ValueError, TypeError):
+            return {"status": 1, "msg": "meme_frequency 必须是整数", "data": None}
+        success, msg = persona_config_manager.set_meme_frequency(persona_name, meme_frequency)
+        if not success:
+            return {"status": 1, "msg": msg, "data": None}
+        persona_settings_manager.get_config(persona_name).set_config("meme_frequency", meme_frequency)
+        results.append(f"meme_frequency: {meme_frequency}")
+
+    if "meme_send_cooldown_sec" in data:
+        raw_cd = data["meme_send_cooldown_sec"]
+        if isinstance(raw_cd, bool):
+            return {"status": 1, "msg": "meme_send_cooldown_sec 必须是整数", "data": None}
+        try:
+            meme_cooldown = int(raw_cd)
+        except (ValueError, TypeError):
+            return {"status": 1, "msg": "meme_send_cooldown_sec 必须是整数", "data": None}
+        success, msg = persona_config_manager.set_meme_send_cooldown_sec(persona_name, meme_cooldown)
+        if not success:
+            return {"status": 1, "msg": msg, "data": None}
+        persona_settings_manager.get_config(persona_name).set_config("meme_send_cooldown_sec", meme_cooldown)
+        results.append(f"meme_send_cooldown_sec: {meme_cooldown}")
 
     # 更新 enabled_tools（如果提供）
     if "enabled_tools" in data:
@@ -867,6 +1081,41 @@ async def update_persona_config(
             }
         results.append(f"capability_agents: {capability_agents}")
 
+    if "prompt_group" in data:
+        prompt_group = data["prompt_group"]
+        if not isinstance(prompt_group, str):
+            return {
+                "status": 1,
+                "msg": "prompt_group 必须是字符串",
+                "data": None,
+            }
+        success, msg = persona_config_manager.set_prompt_group(persona_name, prompt_group)
+        if not success:
+            return {
+                "status": 1,
+                "msg": msg,
+                "data": None,
+            }
+        results.append(f"prompt_group: {prompt_group}")
+
+    if "chat_style" in data:
+        chat_style = data["chat_style"]
+        if isinstance(chat_style, bool) or not isinstance(chat_style, int):
+            return {"status": 1, "msg": "chat_style 必须是整数", "data": None}
+        success, msg = persona_config_manager.set_chat_style(persona_name, chat_style)
+        if not success:
+            return {"status": 1, "msg": msg, "data": None}
+        results.append(f"chat_style: {chat_style}")
+
+    if "speech_len_soft" in data:
+        speech_len_soft = data["speech_len_soft"]
+        if isinstance(speech_len_soft, bool) or not isinstance(speech_len_soft, int):
+            return {"status": 1, "msg": "speech_len_soft 必须是整数", "data": None}
+        success, msg = persona_config_manager.set_speech_len_soft(persona_name, speech_len_soft)
+        if not success:
+            return {"status": 1, "msg": msg, "data": None}
+        results.append(f"speech_len_soft: {speech_len_soft}")
+
     # 返回更新后的配置
     updated_config = persona_config_manager.get_persona_config_dict(persona_name)
     return {
@@ -917,11 +1166,24 @@ async def get_persona_tool_catalog(
 
 
 def _persona_settings_web_dict(persona_name: str) -> Dict[str, Any]:
-    """把 persona.json 序列化成插件配置同构的 ``PluginConfigItem`` 字典。"""
+    """把 persona.json 序列化成插件配置同构的 ``PluginConfigItem`` 字典。
+
+    表情三键以 config.json 为真值源，展示口径与运行时（``resolve_meme_style``）一致。
+    """
+    from gsuid_core.ai_core.persona.chat_style import stored_int
+    from gsuid_core.ai_core.persona.meme_style import DEFAULT_MEME_FREQUENCY
+
     cfg = persona_settings_manager.get_config(persona_name)
+    p_cfg = persona_config_manager.get_config(persona_name)
     data: Dict[str, Any] = {}
     for key in DEFAULT_PERSONA_SETTINGS:
-        data[key] = _build_config_item(cfg.get_config(key), key)
+        item_dict = _build_config_item(cfg.get_config(key), key)
+        if key == "allow_meme_reply" and key in p_cfg.config:
+            item_dict["value"] = bool(p_cfg.get_config(key).data)
+        elif key in ("meme_frequency", "meme_send_cooldown_sec") and key in p_cfg.config:
+            fallback = DEFAULT_MEME_FREQUENCY if key == "meme_frequency" else 0
+            item_dict["value"] = stored_int(p_cfg, key, fallback)
+        data[key] = item_dict
     return data
 
 
@@ -951,7 +1213,10 @@ async def update_persona_settings(
     data: Dict[str, Any],
     _: Dict[str, Any] = Depends(require_auth),
 ) -> Dict[str, Any]:
-    """按 key 写入字符串值。未知键 / 分割线跳过。也可传完整 PluginConfigItem（取 value）。"""
+    """按 key 写入对应配置值。未知键 / 分割线跳过。也可传完整 PluginConfigItem（取 value）。"""
+    blocked = _managed_block(persona_name)
+    if blocked is not None:
+        return blocked
     persona = Persona(persona_name)
     if not persona.exists():
         return {
@@ -965,6 +1230,8 @@ async def update_persona_settings(
             "msg": "请求体必须是对象",
             "data": None,
         }
+    from gsuid_core.utils.plugins_config.models import GsIntConfig, GsStrConfig, GsBoolConfig
+
     cfg = persona_settings_manager.get_config(persona_name)
     updated: list[str] = []
     for key, value in data.items():
@@ -976,13 +1243,38 @@ async def update_persona_settings(
         raw: object = value
         if isinstance(value, dict) and "value" in value and "type" in value:
             raw = value["value"]
-        if not isinstance(raw, str):
-            return {
-                "status": 1,
-                "msg": f"{key} 必须是字符串",
-                "data": None,
-            }
-        if not cfg.set_config(key, raw):
+        val_to_set: object
+        if isinstance(template, GsBoolConfig):
+            if not isinstance(raw, bool):
+                return {"status": 1, "msg": f"{key} 必须是布尔值", "data": None}
+            val_to_set = raw
+        elif isinstance(template, GsIntConfig):
+            if isinstance(raw, bool):
+                return {"status": 1, "msg": f"{key} 必须是整数", "data": None}
+            try:
+                val_to_set = int(raw)  # type: ignore[arg-type]
+            except (ValueError, TypeError):
+                return {"status": 1, "msg": f"{key} 必须是整数", "data": None}
+        elif isinstance(template, GsStrConfig):
+            if not isinstance(raw, str):
+                return {"status": 1, "msg": f"{key} 必须是字符串", "data": None}
+            val_to_set = raw
+        else:
+            continue
+        if key == "allow_meme_reply":
+            ok, msg = persona_config_manager.set_allow_meme_reply(persona_name, bool(val_to_set))
+            if not ok:
+                return {"status": 1, "msg": msg, "data": None}
+        elif key == "meme_frequency":
+            ok, msg = persona_config_manager.set_meme_frequency(persona_name, int(val_to_set))
+            if not ok:
+                return {"status": 1, "msg": msg, "data": None}
+        elif key == "meme_send_cooldown_sec":
+            ok, msg = persona_config_manager.set_meme_send_cooldown_sec(persona_name, int(val_to_set))
+            if not ok:
+                return {"status": 1, "msg": msg, "data": None}
+
+        if not cfg.set_config(key, val_to_set):
             return {
                 "status": 1,
                 "msg": f"写入失败: {key}",
@@ -1074,3 +1366,101 @@ async def get_heartbeat_status(_: Dict[str, Any] = Depends(require_auth)) -> Dic
         }
     except Exception as e:
         return {"status": 1, "msg": f"获取 Heartbeat 状态失败: {e}", "data": None}
+
+
+class PersonaJournalData(TypedDict):
+    persona_name: str
+    content: str
+    standing_summary: str
+    timeline: List[str]
+    timeline_count: int
+
+
+class PersonaJournalResponse(TypedDict):
+    status: int
+    msg: str
+    data: PersonaJournalData
+
+
+class PersonaJournalUpdateRequest(BaseModel):
+    content: str = ""
+
+
+class PersonaJournalSaveData(TypedDict):
+    persona_name: str
+
+
+class PersonaJournalSaveResponse(TypedDict):
+    status: int
+    msg: str
+    data: PersonaJournalSaveData
+
+
+class PersonaJournalCompactData(TypedDict):
+    persona_name: str
+    compacted: bool
+
+
+class PersonaJournalCompactResponse(TypedDict):
+    status: int
+    msg: str
+    data: PersonaJournalCompactData
+
+
+@app.get("/api/persona/{persona_name}/journal", summary="获取指定人格的生活手账", tags=PERSONA)
+async def get_persona_journal(
+    persona_name: str,
+    _: SessionRecord = Depends(require_auth),
+) -> PersonaJournalResponse:
+    """获取指定人格的生活手账全文及解析后的分段结构。"""
+    from gsuid_core.ai_core.journal.manager import (
+        _read_sections,
+        get_journal_content,
+    )
+
+    content = get_journal_content(persona_name)
+    standing, timeline = _read_sections(content)
+    return {
+        "status": 0,
+        "msg": "ok",
+        "data": {
+            "persona_name": persona_name,
+            "content": content,
+            "standing_summary": standing,
+            "timeline": timeline,
+            "timeline_count": len(timeline),
+        },
+    }
+
+
+@app.put("/api/persona/{persona_name}/journal", summary="保存指定人格的生活手账", tags=PERSONA)
+async def update_persona_journal(
+    persona_name: str,
+    data: PersonaJournalUpdateRequest,
+    _: SessionRecord = Depends(require_admin),
+) -> PersonaJournalSaveResponse:
+    """保存生活手账 markdown 全文。"""
+    from gsuid_core.ai_core.journal.manager import save_journal_content
+
+    save_journal_content(persona_name, data.content)
+    return {
+        "status": 0,
+        "msg": "ok",
+        "data": {"persona_name": persona_name},
+    }
+
+
+@app.post("/api/persona/{persona_name}/journal/compact", summary="整理指定人格的生活手账", tags=PERSONA)
+async def compact_persona_journal(
+    persona_name: str,
+    _: SessionRecord = Depends(require_admin),
+) -> PersonaJournalCompactResponse:
+    """触发生活手账整理压缩。"""
+    from gsuid_core.ai_core.journal.manager import compact_journal
+
+    compacted = await compact_journal(persona_name)
+    return {
+        "status": 0,
+        "msg": "ok",
+        "data": {"persona_name": persona_name, "compacted": compacted},
+    }

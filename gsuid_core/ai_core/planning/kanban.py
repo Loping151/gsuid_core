@@ -21,8 +21,12 @@ from gsuid_core.utils.database.base_models import async_maker
 
 from .models import (
     AIAgentTask,
+    KanbanColumn,
+    TaskNodeRole,
     AIAgentTaskLog,
     AIAgentArtifact,
+    RecurringStatus,
+    classify_task_node_role,
 )
 
 # 子任务级别的 asyncio.Lock，防止同一子任务并发被多次派活
@@ -156,7 +160,7 @@ async def create_kanban_tree(
         parent_task_id=None,
         recurring_trigger=recurring_trigger,
         recurring_until=recurring_until,
-        recurring_status="armed" if is_template else "",
+        recurring_status=RecurringStatus.ARMED if is_template else RecurringStatus.NONE,
     )
     # 根任务 root_task_id = 自身 id
     await AIAgentTask.update_data_by_data(select_data={"id": root.id}, update_data={"root_task_id": root.id})
@@ -215,7 +219,7 @@ async def create_kanban_tree(
             recurring_until=sub_recurring_until,
             # 模板子任务的 recurring_status 入库时为空——首次依赖满足时由 executor
             # 转 "armed"；arm 失败时（trigger 解析错）转 "disarmed" 不阻塞下游。
-            recurring_status="",
+            recurring_status=RecurringStatus.NONE,
         )
         child_ids.append(child.id)
         children.append(child)
@@ -290,7 +294,7 @@ async def clone_tree_for_fire(
         template_root_id=template_root.id,
         # 实例本身不是周期任务
         recurring_trigger=None,
-        recurring_status="",
+        recurring_status=RecurringStatus.NONE,
     )
     await AIAgentTask.update_data_by_data(
         select_data={"id": instance_root.id},
@@ -373,7 +377,7 @@ async def list_armed_templates() -> List[AIAgentTask]:
             select(AIAgentTask)
             .where(col(AIAgentTask.node_kind) == "root")
             .where(col(AIAgentTask.recurring_trigger).is_not(None))
-            .where(col(AIAgentTask.recurring_status) == "armed")
+            .where(col(AIAgentTask.recurring_status) == RecurringStatus.ARMED)
         )
         result = await session.execute(stmt)
         return list(result.scalars().all())
@@ -386,7 +390,7 @@ async def list_armed_subtask_templates() -> List[AIAgentTask]:
             select(AIAgentTask)
             .where(col(AIAgentTask.node_kind) == "subtask")
             .where(col(AIAgentTask.recurring_trigger).is_not(None))
-            .where(col(AIAgentTask.recurring_status) == "armed")
+            .where(col(AIAgentTask.recurring_status) == RecurringStatus.ARMED)
             .where(col(AIAgentTask.template_subtask_id).is_(None))
         )
         result = await session.execute(stmt)
@@ -416,7 +420,7 @@ async def clone_subtask_for_fire(template: AIAgentTask) -> Optional[AIAgentTask]
     fresh = await AIAgentTask.get_by_id(template.id)
     if fresh is None:
         return None
-    if fresh.recurring_status != "armed":
+    if fresh.recurring_status != RecurringStatus.ARMED:
         return None
     if fresh.recurring_until is not None and fresh.recurring_until < datetime.now():
         # 模板已过期，自动 disarm
@@ -456,7 +460,7 @@ async def clone_subtask_for_fire(template: AIAgentTask) -> Optional[AIAgentTask]
         # 关键：反向指针，便于 webconsole 把"近 N 次开火"挂到模板下展示
         template_subtask_id=fresh.id,
         recurring_trigger=None,
-        recurring_status="",
+        recurring_status=RecurringStatus.NONE,
     )
 
     # 模板 fire_count +1（条件 UPDATE）
@@ -508,7 +512,7 @@ async def arm_recurring_subtask(template: AIAgentTask, trigger_spec: str) -> Tup
     if not ok:
         await AIAgentTask.update_data_by_data(
             select_data={"id": template.id},
-            update_data={"recurring_status": "disarmed"},
+            update_data={"recurring_status": RecurringStatus.DISARMED},
         )
         await AIAgentTaskLog.add_log(
             template.id,
@@ -518,7 +522,7 @@ async def arm_recurring_subtask(template: AIAgentTask, trigger_spec: str) -> Tup
         return False, f"周期子任务 arm 失败：trigger_spec={trigger_spec!r}"
     await AIAgentTask.update_data_by_data(
         select_data={"id": template.id},
-        update_data={"recurring_status": "armed"},
+        update_data={"recurring_status": RecurringStatus.ARMED},
     )
     await AIAgentTaskLog.add_log(
         template.id,
@@ -541,7 +545,7 @@ async def disarm_subtask_template(subtask_id: str) -> bool:
         return False
     await AIAgentTask.update_data_by_data(
         select_data={"id": subtask_id},
-        update_data={"recurring_status": "disarmed"},
+        update_data={"recurring_status": RecurringStatus.DISARMED},
     )
     await AIAgentTaskLog.add_log(subtask_id, "decision", "周期子任务已 disarm")
     try:
@@ -560,7 +564,7 @@ async def disarm_template(template_root_id: str) -> bool:
         return False
     await AIAgentTask.update_data_by_data(
         select_data={"id": template_root_id},
-        update_data={"recurring_status": "disarmed"},
+        update_data={"recurring_status": RecurringStatus.DISARMED},
     )
     await AIAgentTaskLog.add_log(template_root_id, "decision", "周期模板已 disarm")
     return True
@@ -604,7 +608,7 @@ def is_recurring_subtask_template(task: AIAgentTask) -> bool:
     判据：``node_kind=="subtask"`` + ``recurring_trigger`` 非空 + ``template_subtask_id``
     为空（执行实例的 template_subtask_id 反向指向模板自身）。
     """
-    return task.node_kind == "subtask" and bool(task.recurring_trigger) and not task.template_subtask_id
+    return classify_task_node_role(task) == TaskNodeRole.RECURRING_SUBTASK_TEMPLATE
 
 
 def has_active_recurring_subtask(children: List[AIAgentTask]) -> bool:
@@ -613,7 +617,7 @@ def has_active_recurring_subtask(children: List[AIAgentTask]) -> bool:
     armed 模板表示"持续工作中，未来还要 fire"，等同于 running 的延伸；
     所有 armed 子任务全部 disarmed/cancelled 之前根任务不允许 completed。
     """
-    return any(c.recurring_status == "armed" for c in children if is_recurring_subtask_template(c))
+    return any(c.recurring_status == RecurringStatus.ARMED for c in children if is_recurring_subtask_template(c))
 
 
 def deps_satisfied_for(task: AIAgentTask, children: List[AIAgentTask]) -> bool:
@@ -629,7 +633,8 @@ def deps_satisfied_for(task: AIAgentTask, children: List[AIAgentTask]) -> bool:
     accepted_ids = {
         c.id
         for c in children
-        if c.status in ("completed", "skipped") or (is_recurring_subtask_template(c) and c.recurring_status == "armed")
+        if c.status in ("completed", "skipped")
+        or (is_recurring_subtask_template(c) and c.recurring_status == RecurringStatus.ARMED)
     }
     return all(d in accepted_ids for d in task.dependency_task_ids)
 
@@ -711,17 +716,17 @@ def next_not_before(children: List[AIAgentTask]) -> Optional[datetime]:
 def compute_kanban_column(task: AIAgentTask, deps_satisfied: bool = True) -> str:
     """Kanban 列映射。"""
     if task.status in ("completed", "skipped"):
-        return "Done"
+        return KanbanColumn.DONE.value
     if task.status in ("failed", "cancelled"):
-        return "failed"
+        return KanbanColumn.FAILED.value
     if task.status in ("paused", "waiting_approval"):
-        return "Blocked"
+        return KanbanColumn.BLOCKED.value
     if task.status == "running":
-        return "progress"
+        return KanbanColumn.PROGRESS.value
     # pending：依赖未满足 -> target，依赖满足 -> progress（即将调度）
     if task.status == "pending":
-        return "progress" if deps_satisfied else "target"
-    return "target"
+        return KanbanColumn.PROGRESS.value if deps_satisfied else KanbanColumn.TARGET.value
+    return KanbanColumn.TARGET.value
 
 
 # 状态机：mark_subtask_running / completed / failed
@@ -755,6 +760,8 @@ async def mark_subtask_completed(task: AIAgentTask, output_artifact_id: str = ""
     await AIAgentTask.update_data_by_data(select_data={"id": task.id}, update_data=update_data)
     await AIAgentTaskLog.add_log(task.id, "step_done", f"子任务完成 | output_artifact={output_artifact_id or '-'}")
     _drop_not_before_job(task.id)
+    if task.root_task_id:
+        await refresh_root_status(task.root_task_id)
 
 
 async def mark_subtask_failed(task: AIAgentTask, reason: str) -> None:
@@ -769,6 +776,8 @@ async def mark_subtask_failed(task: AIAgentTask, reason: str) -> None:
     )
     await AIAgentTaskLog.add_log(task.id, "step_failed", f"子任务失败：{reason[:400]}")
     _drop_not_before_job(task.id)
+    if task.root_task_id:
+        await refresh_root_status(task.root_task_id)
 
 
 def _drop_not_before_job(subtask_id: str) -> None:
@@ -804,7 +813,7 @@ def is_leaf_root(root: AIAgentTask, children_count: int) -> bool:
 
     判定：``node_kind == "root"`` + ``agent_profile != ""`` + ``children_count == 0``。
     """
-    return root.node_kind == "root" and bool(root.agent_profile) and children_count == 0
+    return classify_task_node_role(root, children_count) == TaskNodeRole.LEAF_ROOT
 
 
 async def refresh_root_status(root_task_id: str) -> Optional[str]:
@@ -975,7 +984,7 @@ async def respawn_child_task(
         return False, f"子任务当前状态 {task.status} 不可重派（仅 failed / waiting_approval）"
 
     if task.respawn_count >= respawn_limit:
-        # 走统一入口挂审批：开中心票据（幂等），否则对话侧 respond_approval 找不到该请求
+        # 达上限后开中心票据。确认只认私聊确认码或审批中心。
         await request_subtask_approval(
             task,
             f"重派次数达上限 {respawn_limit}，需主人裁决是否继续重试。"
@@ -1009,11 +1018,18 @@ async def respawn_child_task(
     return True, f"已重派子任务（第 {task.respawn_count + 1} 次）"
 
 
-async def request_subtask_approval(task: AIAgentTask, approval_prompt: str) -> None:
+async def request_subtask_approval(
+    task: AIAgentTask,
+    approval_prompt: str,
+    *,
+    dedupe_key: str = "",
+    effect: str = "",
+    plugin_name: str = "",
+    plugin_action: str = "",
+) -> None:
     """把子任务挂为 waiting_approval，并向统一审批中心提交一条 master 级请求。
 
-    ``waiting_approval`` 状态从此是**派生视图**（看板 Blocked 列渲染用）；
-    审批账本 / 裁决入口 / 过期统一在 ``ai_core.approval``。
+    调用会话记当前 agent（capagent_…），群会话放进 payload，只给停机通知用。
     """
     now = datetime.now()
     await AIAgentTask.update_data_by_data(
@@ -1026,19 +1042,46 @@ async def request_subtask_approval(task: AIAgentTask, approval_prompt: str) -> N
     )
     await AIAgentTaskLog.add_log(task.id, "approval", f"请求审批：{approval_prompt[:400]}")
     from gsuid_core.ai_core import approval as approval_center
+    from gsuid_core.ai_core.approval.center import ApprovalPayload
+    from gsuid_core.ai_core.approval.session_ctx import current_caller_session_id
 
-    # 同一子任务重复挂起（重派再达上限等）不重复开票，复用现有 pending
-    existing = await approval_center.AIApprovalRequest.list_pending(category="kanban_subtask", ref_key=task.id)
-    if not existing:
+    caller = current_caller_session_id()
+    payload: ApprovalPayload = {
+        "task_id": task.id,
+        "root_task_id": task.root_task_id or "",
+        "agent_profile": task.agent_profile or "",
+        "ws_bot_id": task.WS_BOT_ID or "",
+    }
+    if plugin_name:
+        payload["plugin_name"] = plugin_name
+    if plugin_action:
+        payload["plugin_action"] = plugin_action
+    existing = None
+    if dedupe_key:
+        existing = await approval_center.AIApprovalRequest.get_pending_by_dedupe(dedupe_key)
+    if existing is None:
+        existing_rows = await approval_center.AIApprovalRequest.list_pending(category="kanban_subtask", ref_key=task.id)
+        existing = existing_rows[0] if existing_rows else None
+    if existing is None:
         await approval_center.submit(
             category="kanban_subtask",
             title=f"任务#{task.ordinal}｜{task.display_name}：{approval_prompt[:400]}",
             audience="master",
             ref_key=task.id,
             operator_user_id=task.owner_user_id,
-            origin_session_id=task.session_id or "",
-            payload={"task_id": task.id, "root_task_id": task.root_task_id or ""},
+            operator_user_pm=task.user_pm,
+            origin_session_id=caller,
+            parent_session_id=task.session_id or "",
+            dedupe_key=dedupe_key,
+            effect=effect or approval_prompt[:200],
+            payload=payload,
+            bot_id=task.bot_id,
+            bot_self_id=task.bot_self_id,
+            user_type=task.user_type,
+            group_id=task.group_id,
         )
+    else:
+        approval_center.note_submit_reused(existing.request_id)
     if task.root_task_id:
         await refresh_root_status(task.root_task_id)
 
@@ -1054,6 +1097,8 @@ async def approve_subtask(task: AIAgentTask, approved: bool, note: str = "") -> 
             update_data={"status": "pending", "updated_at": now},
         )
         await AIAgentTaskLog.add_log(task.id, "approval", f"主人批准：{note}")
+        if task.root_task_id:
+            await refresh_root_status(task.root_task_id)
         return True, "已批准，子任务进入 pending 等待调度"
     await AIAgentTask.update_data_by_data(
         select_data={"id": task.id},
@@ -1064,6 +1109,8 @@ async def approve_subtask(task: AIAgentTask, approved: bool, note: str = "") -> 
         },
     )
     await AIAgentTaskLog.add_log(task.id, "approval", f"主人拒绝：{note}")
+    if task.root_task_id:
+        await refresh_root_status(task.root_task_id)
     return True, "已拒绝，子任务标记 failed"
 
 
@@ -1085,10 +1132,10 @@ async def fail_task_tree(root_task_id: str, reason: str) -> bool:
     for c in children:
         if c.status in ("completed", "skipped", "failed", "cancelled"):
             # 即使子任务已"完结"，如果是 armed 周期模板，也要摘除 APScheduler
-            if is_recurring_subtask_template(c) and c.recurring_status == "armed":
+            if is_recurring_subtask_template(c) and c.recurring_status == RecurringStatus.ARMED:
                 await AIAgentTask.update_data_by_data(
                     select_data={"id": c.id},
-                    update_data={"recurring_status": "disarmed"},
+                    update_data={"recurring_status": RecurringStatus.DISARMED},
                 )
                 _drop_subtask_recurring_job(c.id)
             continue
@@ -1105,10 +1152,10 @@ async def fail_task_tree(root_task_id: str, reason: str) -> bool:
         _drop_subtask_recurring_job(c.id)
     # 兜底：把任何残留的 armed 周期子任务模板都 disarm
     for c in children:
-        if is_recurring_subtask_template(c) and c.recurring_status == "armed":
+        if is_recurring_subtask_template(c) and c.recurring_status == RecurringStatus.ARMED:
             await AIAgentTask.update_data_by_data(
                 select_data={"id": c.id},
-                update_data={"recurring_status": "disarmed"},
+                update_data={"recurring_status": RecurringStatus.DISARMED},
             )
             _drop_subtask_recurring_job(c.id)
     await AIAgentTaskLog.add_log(root.id, "decision", f"整棵任务树被终结：{reason} | 级联失败 {cascaded} 子任务")

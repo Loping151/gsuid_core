@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, List, TypeVar, Protocol, Sequence
 
 from pydantic_ai import Agent
+from pydantic_ai.tools import Tool
 from pydantic_ai.settings import ModelSettings, merge_model_settings
 from pydantic_ai.capabilities import AbstractCapability
 
@@ -34,6 +35,7 @@ from gsuid_core.ai_core.rag.tools import (
 )
 from gsuid_core.ai_core.tool_risk import skill_tool_visible
 from gsuid_core.ai_core.tool_safety import build_tool_safety_capability
+from gsuid_core.ai_core.control.lines import STATE_PERSISTED_FAMILY_HINT, turn_seed_hint_line
 from gsuid_core.ai_core.agent_run.host import RunOnceHost
 from gsuid_core.ai_core.agent_run.state import (
     RunOnceState,
@@ -42,6 +44,7 @@ from gsuid_core.ai_core.agent_run.state import (
 from gsuid_core.ai_core.dynamic_toolset import RetrievableToolset
 from gsuid_core.ai_core.agent_run.support import (
     _INTERACTIVE_CREATE_BY,
+    _MAIN_PERSONA_CREATE_BY,
     _append_user_text,
     _pool_overlaps_capability_agent,
     _capability_exclusive_tool_names,
@@ -85,31 +88,6 @@ def l2_state_driven_wanted(
     if not is_group:
         return True
     return call_to_self or followup_detected
-
-
-def group_idle_request_limit(
-    default_limit: int,
-    *,
-    is_group: bool,
-    followup_detected: bool,
-    has_active_task: bool,
-    idle_cap: int,
-    call_to_self: bool = False,
-) -> int:
-    """纯旁观群聊轮收窄 request_limit；点名与省略续聊不收。
-
-    收窄只针对「无人寻址 + 无跟进 + 无在途任务」这一类——它们本不该干活，
-    放开到 multi_agent_lenth 就是零工具空转的烧钱口子。省略续聊轮
-    （``followup_detected`` = ellipsis_followup / task_management）要跑得完
-    find_tools → 真正查询的两跳链路，早期的收窄误伤了它们，见 §12.8。
-    """
-    if default_limit < 1 or idle_cap < 1:
-        return default_limit
-    if call_to_self:
-        return default_limit
-    if is_group and not followup_detected and not has_active_task:
-        return min(default_limit, idle_cap)
-    return default_limit
 
 
 def snapshot_tool_allowed(
@@ -174,6 +152,27 @@ class _NamedTool(Protocol):
 _SeedT = TypeVar("_SeedT", bound=_NamedTool)
 
 
+def pick_turn_seed_names(
+    tools: Sequence[_NamedTool],
+    seeds: Sequence[_NamedTool],
+    *,
+    exclusive: set[str],
+    cap: int = _TURN_SEED_CAP,
+) -> list[str]:
+    """append_turn_seeds 的同款挑选，只算不装：跳过已装/空名/exclusive，至多 cap 个。"""
+    seen = {tool.name for tool in tools}
+    picked: list[str] = []
+    for tool in seeds:
+        if len(picked) >= cap:
+            break
+        name = tool.name
+        if not name or name in seen or name in exclusive:
+            continue
+        seen.add(name)
+        picked.append(name)
+    return picked
+
+
 def append_turn_seeds(
     tools: list[_SeedT],
     seeds: Sequence[_SeedT],
@@ -182,18 +181,14 @@ def append_turn_seeds(
     cap: int = _TURN_SEED_CAP,
 ) -> list[str]:
     """把本轮种子接到 schema 末尾。调用方不得把这些名字写入会话快照。"""
-    seen = {tool.name for tool in tools}
-    added: list[str] = []
+    picked = pick_turn_seed_names(tools, seeds, exclusive=exclusive, cap=cap)
+    by_name: dict[str, _SeedT] = {}
     for tool in seeds:
-        if len(added) >= cap:
-            break
-        name = tool.name
-        if not name or name in seen or name in exclusive:
-            continue
-        tools.append(tool)
-        seen.add(name)
-        added.append(name)
-    return added
+        if tool.name not in by_name:
+            by_name[tool.name] = tool
+    for name in picked:
+        tools.append(by_name[name])
+    return picked
 
 
 # 回想核内只有 search_cognition；attach_article 走 find_tools，避免每轮写工具进 schema。
@@ -227,11 +222,6 @@ def complete_kernel_family_names(core_names: Sequence[str], *, exclusive: set[st
         for tb in get_tools_by_capability_domain(domain):
             _add(tb.name)
     return out
-
-
-STATE_PERSISTED_FAMILY_HINT = (
-    "\n\n（系统提示：当前会话已有持久条目。变更已有条目请用对应能力族的查询/修改/取消工具，不要再创建一条来代替。）"
-)
 
 
 def stabilize_session_tool_names(
@@ -322,10 +312,21 @@ class ToolsPhase(RunOnceHost):
             exclusive=exclusive,
             ceiling=_session_tool_ceiling(),
         )
+        from gsuid_core.ai_core.approval.session_ctx import session_has_pending
+
+        if session_has_pending(self.session_id or "") and "check_approval" not in names:
+            names = [*names, "check_approval"]
         self._session_toolset_frozen = names
         self._session_toolset_tags = tags
         out: ToolList = []
+        by_name: dict[str, Tool[ToolContext]] = {}
+        for t in list(core) + list(extras):
+            if t.name not in by_name:
+                by_name[t.name] = t
         for name in names:
+            if name in by_name:
+                out.append(by_name[name])
+                continue
             tb = find_tool_base(name)
             if tb is not None:
                 out.append(tb.tool)
@@ -333,6 +334,19 @@ class ToolsPhase(RunOnceHost):
 
     async def _run_once_assemble_tools(self, st: RunOnceState) -> None:
         """工具五层装配 + 去重 + 渐进式暴露。"""
+        from gsuid_core.ai_core.command_aside.policy import aside_blocks_tools
+
+        if aside_blocks_tools():
+            st.tools = []
+            st.tool_names = []
+            st.exposed_tool_names = []
+            self._last_assembled_domains = set()
+            blocked_ctx = _require_context(st)
+            from gsuid_core.ai_core.output_firewall import EXPOSED_TOOLS_EXTRA_KEY
+
+            blocked_ctx.extra[EXPOSED_TOOLS_EXTRA_KEY] = []
+            self._session_logger.log_tools_list([])
+            return
         # 渐进式工具暴露是否在本轮生效（仅自动装配 + 非闲聊轮）。决定是否挂 RetrievableToolset。
         st.expose_dynamic = False
         # 媒体句柄（event 字段或正文 img_/图片ID 标注）——通道信号，非话题词
@@ -412,7 +426,10 @@ class ToolsPhase(RunOnceHost):
         if st.addr_gated:
             # C-3 寻址门（**内核密封**）：@别人且未点自己 → 零工具，且不打 ASSEMBLE_TOOLS
             st.tools = []
+            _caller_by_name: dict[str, Tool[ToolContext]] = {}
         elif _assemble or self.create_by in _AGENTIC_CREATE_BY:
+            _caller_tools: ToolList = list(st.tools) if st.tools else []
+            _caller_by_name = {t.name: t for t in _caller_tools}
             if _assemble:
                 qy = ""
                 # 框架回灌：交付包不作向量检索 query（避免噪声 + 误装工具）
@@ -422,9 +439,13 @@ class ToolsPhase(RunOnceHost):
                     elif st.ev is not None:
                         qy = st.ev.raw_text
 
-                # 第一层：群/私同一通道核（创建类提醒钉核；列出/改/删走 L2 / 检索 / find_tools）。
-                core_tools = await get_main_agent_tools()
-                core_names = {t.name for t in core_tools}
+                # 调用方传入的默认工具置顶进核且优先覆盖同名全局工具，防会话顶截断或被替换
+                core_tools: ToolList = list(_caller_tools)
+                core_names: set[str] = {t.name for t in core_tools}
+                for _mt in await get_main_agent_tools():
+                    if _mt.name not in core_names:
+                        core_names.add(_mt.name)
+                        core_tools.append(_mt)
                 _fam_exclusive = _capability_exclusive_tool_names()
                 for _tn in complete_kernel_family_names(list(core_names), exclusive=_fam_exclusive):
                     if _tn in core_names:
@@ -433,12 +454,6 @@ class ToolsPhase(RunOnceHost):
                     if _tb is not None:
                         core_names.add(_tn)
                         core_tools.append(_tb.tool)
-
-                # 调用方显式传入的基础工具（dynamic 节点的 packs+白名单）并入保底
-                for _bt in st.tools:
-                    if _bt.name not in core_names:
-                        core_names.add(_bt.name)
-                        core_tools.append(_bt)
 
                 # 节点显式白名单：persona 投影节点在 config.json 声明的 st.tool_names 并入保底
                 if self.persona_name:
@@ -567,6 +582,7 @@ class ToolsPhase(RunOnceHost):
                     from gsuid_core.ai_core.entity_index import (
                         ALIAS_ROUTE_TEXT_KEY,
                         ALIAS_PLUGIN_EXTRA_KEY,
+                        ALIAS_PLUGIN_EXPLICIT_EXTRA_KEY,
                         lock_plugin,
                         strip_surfaces,
                         plugins_in_text,
@@ -587,13 +603,16 @@ class ToolsPhase(RunOnceHost):
                         from gsuid_core.ai_core.turn_pipeline import build_group_history_block
 
                         _bg = build_group_history_block(st.ev)
-                    _ctx_plugin = lock_plugin(_scan, _bg)
-                    if _ctx_plugin:
-                        st.run_extra[ALIAS_PLUGIN_EXTRA_KEY] = _ctx_plugin
+                    _lock = lock_plugin(_scan, _bg)
+                    if _lock.plugin:
+                        st.run_extra[ALIAS_PLUGIN_EXTRA_KEY] = _lock.plugin
+                        st.run_extra[ALIAS_PLUGIN_EXPLICIT_EXTRA_KEY] = _lock.explicit
                         if _scan:
                             st.run_extra[ALIAS_ROUTE_TEXT_KEY] = _scan
-                        turn_seeds = await align_seeds_to_context_plugin(turn_seeds, _ctx_plugin, _scan or qy, _scope)
-                    if _call_self:
+                        turn_seeds = await align_seeds_to_context_plugin(
+                            turn_seeds, _lock.plugin, _scan or qy, _scope, hard=_lock.explicit
+                        )
+                    if _call_self and st.intent != "闲聊":
                         _routed = plugins_in_text(_scan)
                         # 向量检索命中不算。要实体路由真正装上该插件的工具。
                         if len(_utter) >= 12 and _routed:
@@ -675,19 +694,67 @@ class ToolsPhase(RunOnceHost):
                                 )
                             )
 
-                _added_seeds = append_turn_seeds(
-                    st.tools,
-                    turn_seeds,
-                    exclusive=_capability_exclusive_tool_names(),
-                )
-                if _added_seeds:
-                    logger.debug(
-                        i18n_t(
-                            "log.agent.turn_seed_exposed",
-                            n=len(_added_seeds),
-                            names=_added_seeds,
-                        )
+                # 渐进式工具暴露：PIN 恒在 schema，是否调用交给模型。
+                if ENABLE_PROGRESSIVE_TOOLS:
+                    if any(t.name == "find_tools" for t in st.tools):
+                        st.expose_dynamic = True
+                    else:
+                        ft = find_tool_base("find_tools")
+                        if ft is not None:
+                            st.tools.append(ft.tool)
+                            st.expose_dynamic = True
+                    if st.expose_dynamic:
+                        logger.debug(i18n_t("log.agent.find_tools_progressive_exposure"))
+
+                if st.expose_dynamic:
+                    # 种子不进 schema：工具数组每轮变动会让前缀缓存从工具段起失效。
+                    # 改成当轮 user 侧一行提示，要哪个用 find_tools(need="确切名") 挂。
+                    _hint_picked = pick_turn_seed_names(
+                        st.tools,
+                        turn_seeds,
+                        exclusive=_capability_exclusive_tool_names(),
                     )
+                    if _hint_picked:
+                        from gsuid_core.ai_core.buildin_tools.find_tools_rank import tool_brief
+
+                        _hint_items: list[str] = []
+                        _hint_names: list[str] = []
+                        for _sn in _hint_picked:
+                            _stb = find_tool_base(_sn)
+                            if _stb is None:
+                                continue
+                            _brief = " ".join(
+                                tool_brief(covers=list(_stb.covers), description=_stb.description).split()
+                            )[:40]
+                            _hint_items.append(f"`{_sn}`：{_brief}")
+                            _hint_names.append(_sn)
+                        if _hint_items:
+                            st.hinted_seed_names = _hint_names
+                            st.final_user_message = _append_user_text(
+                                st.final_user_message,
+                                turn_seed_hint_line("；".join(_hint_items)),
+                            )
+                            logger.debug(
+                                i18n_t(
+                                    "log.agent.turn_seed_hinted",
+                                    n=len(_hint_names),
+                                    names=_hint_names,
+                                )
+                            )
+                else:
+                    _added_seeds = append_turn_seeds(
+                        st.tools,
+                        turn_seeds,
+                        exclusive=_capability_exclusive_tool_names(),
+                    )
+                    if _added_seeds:
+                        logger.debug(
+                            i18n_t(
+                                "log.agent.turn_seed_exposed",
+                                n=len(_added_seeds),
+                                names=_added_seeds,
+                            )
+                        )
 
                 _need_subagent = _did_strip_exclusive
                 deleg_pid = ""
@@ -696,7 +763,7 @@ class ToolsPhase(RunOnceHost):
                     if deleg_pid:
                         _need_subagent = True
                     elif not _need_subagent:
-                        _pool_names = {t.name for t in st.tools}
+                        _pool_names = {t.name for t in st.tools} | set(st.hinted_seed_names)
                         _domain_pid = _pool_overlaps_capability_agent(_pool_names)
                         if _domain_pid:
                             _need_subagent = True
@@ -711,18 +778,6 @@ class ToolsPhase(RunOnceHost):
                                 deleg_pid=deleg_pid or "exclusive_strip",
                             )
                         )
-
-                # 渐进式工具暴露：PIN 恒在 schema，是否调用交给模型。
-                if ENABLE_PROGRESSIVE_TOOLS:
-                    if any(t.name == "find_tools" for t in st.tools):
-                        st.expose_dynamic = True
-                    else:
-                        ft = find_tool_base("find_tools")
-                        if ft is not None:
-                            st.tools.append(ft.tool)
-                            st.expose_dynamic = True
-                    if st.expose_dynamic:
-                        logger.debug(i18n_t("log.agent.find_tools_progressive_exposure"))
 
                 logger.debug(
                     i18n_t(
@@ -742,6 +797,7 @@ class ToolsPhase(RunOnceHost):
             else:
                 logger.debug(i18n_t("log.agent.passed_tools_list_arguments", p0=len(st.tools)))
         else:
+            _caller_by_name = {t.name: t for t in st.tools} if st.tools else {}
             logger.debug(i18n_t("log.agent.skip_tool_search_searching_tools"))
 
         # 工具装配套件与第三方钉工具点后各剥离一次 exclusive，防误装 render_* 工具。
@@ -751,7 +807,18 @@ class ToolsPhase(RunOnceHost):
 
         logger.debug(i18n_t("log.agent.tool_list", p0=[tool.name for tool in st.tools]))
 
-        # 最终去重（兼容外部直接传入 st.tools 的情况）
+        # 最终去重（兼容外部直接传入 st.tools 的情况），且同名工具始终保留调用方默认实现
+        from gsuid_core.ai_core.command_aside.policy import aside_extra_tools
+
+        for extra_tool in aside_extra_tools():
+            st.tools.append(extra_tool)
+        if _caller_by_name:
+            st.tools = [_caller_by_name[t.name] if t.name in _caller_by_name else t for t in st.tools]
+        if self.create_by == "Autonomy":
+            from gsuid_core.ai_core.autonomy.tools import autonomy_tool_allowed
+
+            # 钩子不能把发送或高危工具塞回自主行动。
+            st.tools = [tool for tool in st.tools if autonomy_tool_allowed(tool.name)]
         st.tools = list({obj.name: obj for obj in st.tools}.values())
         st.tool_names = [t.name for t in st.tools]
         st.exposed_tool_names = list(st.tool_names)
@@ -759,6 +826,16 @@ class ToolsPhase(RunOnceHost):
         from gsuid_core.ai_core.output_firewall import EXPOSED_TOOLS_EXTRA_KEY
 
         _ctx.extra[EXPOSED_TOOLS_EXTRA_KEY] = list(st.tool_names)
+
+        # 主会话工具集在会话内只增不减：把本轮实际暴露的非 exclusive 工具沉淀进表
+        if self.create_by in _MAIN_PERSONA_CREATE_BY:
+            _exclusive = _capability_exclusive_tool_names()
+            for _tname in st.tool_names:
+                if _tname not in _exclusive:
+                    if self._session_toolset_frozen is not None and _tname not in self._session_toolset_frozen:
+                        self._session_toolset_frozen.append(_tname)
+                    if _tname not in self._session_appended_tools:
+                        self._session_appended_tools.append(_tname)
 
         # 回填本轮装配工具的能力域，供 handle_ai 偏好注入精确过滤（"装配后回传"）： 把工具名映射回 capability_domain
         # handle_ai 据此只注入本轮可用工具相关的软偏好。
@@ -773,6 +850,27 @@ class ToolsPhase(RunOnceHost):
 
         # 记录本次传给 AI 的工具列表
         self._session_logger.log_tools_list(st.tool_names)
+        # tools_change：与上一轮装配名单对比，只记有增删或有提示种子的轮次。
+        # 首轮无基线只记提示；aside 早退路径不动基线。
+        from gsuid_core.ai_core.prefix_probe import tools_diff
+
+        _prev_tool_names = self._last_logged_tool_names
+        _tc_added: list[str] = []
+        _tc_removed: list[str] = []
+        if _prev_tool_names is not None:
+            _tc_diff = tools_diff(_prev_tool_names, st.tool_names)
+            _tc_added = _tc_diff["added"]
+            _tc_removed = _tc_diff["removed"]
+        if _tc_added or _tc_removed or st.hinted_seed_names:
+            self._session_logger.log_tools_change(
+                source="assembly",
+                added=_tc_added,
+                removed=_tc_removed,
+                hinted=list(st.hinted_seed_names),
+                total=len(st.tool_names),
+                from_find_tools=[n for n in _tc_added if n in self._last_run_find_tools_names],
+            )
+        self._last_logged_tool_names = list(st.tool_names)
 
     async def _fire_tool_hooks(self, st: RunOnceState) -> None:
         """开火 H14（装配套件）与 H15（第三方钉/砍工具），每点之后收口一次。
@@ -864,6 +962,17 @@ class ToolsPhase(RunOnceHost):
         if self.model:
             # 必须拷贝：self.model.settings 是模型对象的共享状态，就地改会污染后续所有 run
             _base_settings: ModelSettings = self.model.settings.copy() if self.model.settings else ModelSettings()
+            thinking_override = self.thinking
+            if thinking_override is not None:
+                _base_settings["thinking"] = thinking_override
+            elif self.create_by in (
+                "MemEntityExtraction",
+                "MemPreferenceDistill",
+                "MemSummary",
+                "MemProfileExtraction",
+                "MemClusterNaming",
+            ):
+                _base_settings["thinking"] = False
             if memory_config.eval_mode:
                 _base_settings["temperature"] = 0.0
             # 归属透传（默认关闭）：把本次 run 的调用方标识按配置带给上游网关

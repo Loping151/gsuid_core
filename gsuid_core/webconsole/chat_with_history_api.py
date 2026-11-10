@@ -13,7 +13,6 @@ Chat With History API
 """
 
 import uuid
-import asyncio
 from typing import TYPE_CHECKING, List, Union, Optional
 
 from fastapi import Depends
@@ -23,10 +22,8 @@ from gsuid_core.bot import _Bot
 from gsuid_core.i18n import t
 from gsuid_core.logger import logger
 from gsuid_core.webconsole.app_app import app
-from gsuid_core.ai_core.memory.scope import ScopeType, make_scope_key
 from gsuid_core.ai_core.memory.observer import parse_iso_or_unix_timestamp
 from gsuid_core.webconsole._local_test_gate import LOCAL_TEST_MODE, require_local_test
-from gsuid_core.ai_core.memory.ingestion.hiergraph import rebuild_task
 
 from ._api_tags import CHAT
 
@@ -95,6 +92,8 @@ _MEMORY_EVAL_GUIDE = (
     "do not substitute a nearby fact.\n"
     "10) Relative phrases (how many days/weeks ago, last Friday) are relative to "
     "the injected clock_at / [当前时间] stamp, not the real-world calendar.\n"
+    "11) If the injected fragments do not answer the question, call search_cognition "
+    "with a focused query before concluding that no record exists.\n"
 )
 
 
@@ -179,7 +178,6 @@ async def chatWithHistory(
         persona_name=persona_name,
         create_by=_create_by,
         max_history=0 if req.as_judge else req.max_history,
-        max_iterations=None,
         task_level="low" if req.as_judge else "high",
         session_id=(f"judge_{user_id}" if req.as_judge else f"test_{user_id}_{uuid.uuid4().hex[:8]}"),
         dynamic_tools=http_dynamic_tools(as_judge=req.as_judge, enable_tools=req.enable_tools),
@@ -258,21 +256,36 @@ async def chatWithHistory(
 
 
 def _load_request_history(agent: "GsCoreAIAgent", history: List[ChatHistoryTurn], guard_on: bool) -> None:
-    from pydantic_ai.messages import TextPart, ModelRequest, ModelResponse, UserPromptPart
+    from pydantic_ai.messages import (
+        TextPart,
+        ModelRequest,
+        ModelResponse,
+        UserPromptPart,
+        ModelRequestPart,
+        SystemPromptPart,
+    )
 
     from gsuid_core.ai_core.content_guard import annotate_untrusted_message
 
-    model_messages = []
+    model_messages: list[ModelRequest | ModelResponse] = []
+    sys_injected = False
     for turn in history:
         if not turn.content:
             continue
         if turn.role == "user":
             content = annotate_untrusted_message(turn.content) if guard_on else turn.content
-            model_messages.append(ModelRequest(parts=[UserPromptPart(content=content)]))
+            parts: list[ModelRequestPart] = []
+            if not sys_injected and agent.system_prompt:
+                parts.append(SystemPromptPart(content=agent.system_prompt))
+                sys_injected = True
+            parts.append(UserPromptPart(content=content))
+            model_messages.append(ModelRequest(parts=parts))
         elif turn.role == "assistant":
             model_messages.append(ModelResponse(parts=[TextPart(content=turn.content)]))
     if model_messages:
-        agent.history = model_messages
+        if not sys_injected and agent.system_prompt:
+            model_messages.insert(0, ModelRequest(parts=[SystemPromptPart(content=agent.system_prompt)]))
+        agent.history = list(model_messages)
         agent.extract_history()
 
 
@@ -298,14 +311,11 @@ async def _ingest_request_history(
             observer_blacklist=memory_config.observer_blacklist,
             message_type=msg_type,
             timestamp=parse_iso_or_unix_timestamp(turn.timestamp),
+            persona_name=req.persona_name or "",
         )
     worker = get_ingestion_worker()
     if worker is not None:
         await worker.flush_all()
     if memory_config.eval_mode or req.trigger_rebuild:
-        scope_key = make_scope_key(
-            ScopeType.USER_GLOBAL if not group_id else ScopeType.GROUP,
-            str(group_id) if group_id else str(user_id),
-        )
-        logger.info(t("log.webconsole.memory_manually_triggered_hierarchical", scope_key=scope_key))
-        asyncio.create_task(rebuild_task(scope_key))
+        # schema_v2：向量/FTS 已随 Episode 同步写入，无需再触发分层图重建。
+        logger.debug(t("log.webconsole.memory_manually_triggered_hierarchical", scope_key="schema_v2"))

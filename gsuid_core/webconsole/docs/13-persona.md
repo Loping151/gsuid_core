@@ -591,11 +591,22 @@ Authorization: Bearer <token>
 **响应字段说明**：
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| ai_mode | array | AI行动模式列表，可选值："提及应答", "定时巡检", "趣向捕捉(暂不可用)", "困境救场(暂不可用)" |
+| ai_mode | array | AI行动模式列表，可选值："提及应答", "定时巡检", "命令补充", "自主行动" |
+| active_hours | array | 作息，如 `["08:00-23:30"]`。时段外不定时巡检，也不自主行动 |
+| timezone | string | IANA 时区，默认 `Asia/Shanghai` |
+| autonomy_interval_minutes | int | 自主行动冷却，15–720，默认 45 |
+| autonomy_care_min_zone | string | `familiar` 或 `close`。主人始终在关心名单里 |
 | scope | string | 启用范围：`disabled` / `global`（全部群+私聊） / `global_group`（仅全部群聊） / `global_private`（仅全部私聊） / `specific`（仅指定群聊/用户） |
 | target_groups | array | 当 scope 为 "specific" 时，指定该人格对哪些群聊/角色启用 |
 | inspect_interval | integer | 定时巡检间隔（分钟），当 ai_mode 包含"定时巡检"时有效，可选值：5, 10, 15, 30, 60 |
 | keywords | array | 唤醒关键词列表，当 ai_mode 包含"提及应答"时有效，消息包含这些关键词也会触发AI响应 |
+| aside_image_probability | number | 命令补充：回复只有图片时补一句的概率，0 到 1。默认 0.2 |
+| aside_text_probability | number | 命令补充：回复只有文字时补一句的概率，0 到 1。默认 0.35 |
+| aside_mixed_probability | number | 命令补充：图文都有时补一句的概率，0 到 1。默认 0.25 |
+| aside_allow_tools | boolean | 命令补充能否使用工具（含阅读这条命令所属插件目录）。默认 false |
+| allow_meme_reply | boolean | 是否允许表情回复。打开后系统提示写入 `<meme:情绪>` 协议；关掉后不写这段，也不发送表情。默认 true |
+| meme_frequency | integer | 表情发送频率，0 到 100，默认 50。控制系统提示里的触发契约：0=禁用表情，1-19=极少回敬，20-39=低频点缀，40-64=自然适中，65-84=高频活跃，85-100=极高频必配。同时联动未显式指定时的发图冷却 |
+| meme_send_cooldown_sec | integer | 同会话表情发送最小间隔（秒），0 到 3600，默认 0。0 表示跟随表情频率档位自适应联动（如适中60s、极高频15s），大于0时以此固定秒数为准 |
 
 > 历史字段 `pre_tool_expressions`（工具前摇台词）已废弃：框架不再播报固定台词，
 > 耗时工具前的告知改由 Agent 按系统约束用角色口吻自行组织。已有配置中的该字段会被忽略。
@@ -647,6 +658,13 @@ Content-Type: application/json
 | target_groups | array | 否 | 目标群聊/角色列表，当 scope 为 "specific" 时生效 |
 | inspect_interval | integer | 否 | 定时巡检间隔（分钟），当 ai_mode 包含"定时巡检"时生效，可选值：5, 10, 15, 30, 60 |
 | keywords | array | 否 | 唤醒关键词列表，当 ai_mode 包含"提及应答"时生效，消息包含这些关键词也会触发AI响应 |
+| aside_image_probability | number | 否 | 命令补充只发图片时的概率，0 到 1 |
+| aside_text_probability | number | 否 | 命令补充只发文字时的概率，0 到 1 |
+| aside_mixed_probability | number | 否 | 命令补充图文混合时的概率，0 到 1 |
+| aside_allow_tools | boolean | 否 | 命令补充是否允许使用工具 |
+| allow_meme_reply | boolean | 否 | 是否允许表情回复 |
+| meme_frequency | integer | 否 | 表情发送频率，0 到 100。控制触发倾向契约并联动派生冷却 |
+| meme_send_cooldown_sec | integer | 否 | 表情发送冷却（秒，0 到 3600）。0 为跟随档位自适应 |
 
 **响应**：
 ```json
@@ -835,4 +853,4 @@ Content-Type: application/json
 
 **响应**：与 13.17 相同结构的完整设定字典。
 
-**错误**：角色不存在 / 非字符串值 / 写入失败时 `status=1`。
+**错误**：角色不存在 / 类型不匹配 / 范围越界 / 写入失败时 `status=1`。
