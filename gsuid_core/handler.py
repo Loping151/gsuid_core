@@ -985,6 +985,7 @@ async def msg_process(msg: MessageReceive) -> Event:
         msg.sender,
         msg.user_pm,
         real_bot_id=msg.bot_id,
+        at_info=msg.at_info,
     )
     _content: List[Message] = []
     if msg.user_type == "direct":

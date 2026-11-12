@@ -201,6 +201,8 @@ class MessageReceive(Struct):
     sender: Dict[str, Any] = {}
     user_pm: int = 6
     content: List[Message] = []
+    # {被at者id: {"avatar": url, "nickname": ...}}，结构同 sender；适配器未提供时为空
+    at_info: Dict[str, Dict[str, Any]] = {}
 
 
 class Event(MessageReceive):

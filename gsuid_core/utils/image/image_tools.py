@@ -313,7 +313,15 @@ def _list_dir(path: Path) -> List[Path]:
 
 async def get_event_avatar(ev: Event, avatar_path: Optional[Path] = None) -> Image.Image:
     img = None
-    if ev.bot_id == "onebot" and ev.at:
+    at_avatar = (ev.at_info.get(ev.at) or {}).get("avatar") if ev.at else None
+    if isinstance(at_avatar, str) and at_avatar.startswith(("http://", "https://")):
+        try:
+            content = (await sget(at_avatar, use_cache=True)).content
+            img = Image.open(BytesIO(content)).convert("RGBA")
+        except (httpx.HTTPError, OSError, TimeoutError):
+            img = None
+
+    if img is None and ev.bot_id == "onebot" and ev.at:
         img = await get_qq_avatar(ev.at)
 
     if img is None and "avatar" in ev.sender and ev.sender["avatar"]:
