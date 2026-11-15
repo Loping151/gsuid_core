@@ -622,3 +622,36 @@ def test_emoji_assembly_and_plugin_locale_isolation(tmp_path: Path) -> None:
     resolved = t(sample_key, lang="zh-cn", name="world")
     assert "hello" in resolved and "world" in resolved and sample_key not in resolved
     unregister_plugin_locales(plugin_name)
+
+
+def test_stdout_level_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """log.stdout_level 只抬高控制台下限，实际取它和 level 中较高的一个；非法值忽略。"""
+    import sys
+    import logging
+
+    import gsuid_core.logger as logger_mod
+
+    root = logging.getLogger()
+    saved = list(root.handlers)
+
+    def stdout_level(cfg: dict) -> int:
+        monkeypatch.setattr(logger_mod.core_config, "get_config", lambda key: cfg if key == "log" else None)
+        root.handlers.clear()
+        try:
+            logger_mod.setup_logging()
+            levels = [
+                h.level
+                for h in root.handlers
+                if isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) is sys.stdout
+            ]
+            assert len(levels) == 1
+            return levels[0]
+        finally:
+            root.handlers[:] = saved
+
+    base = {"level": "INFO", "output": ["stdout"], "module": False}
+    assert stdout_level(base) == logging.INFO  # 老配置没有该键：沿用 level
+    assert stdout_level({**base, "stdout_level": "TRACE"}) == logging.INFO
+    assert stdout_level({**base, "stdout_level": "WARNING"}) == logging.WARNING
+    assert stdout_level({**base, "level": "ERROR", "stdout_level": "WARNING"}) == logging.ERROR
+    assert stdout_level({**base, "stdout_level": "bogus"}) == logging.INFO

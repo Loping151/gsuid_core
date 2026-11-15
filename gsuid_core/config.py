@@ -76,6 +76,9 @@ CORE_CONFIG: Dict[str, Any] = {
     "misfire_grace_time": 90,
     "log": {
         "level": SelectOption("INFO", ["TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]),
+        # 控制台(stdout)另设下限，实际取它和 level 中较高的一个。用 systemd 跑时 stdout 会进 journald，
+        # 文件日志已有全量，可把这里调到 WARNING，避免每条 INFO 在磁盘上存两份
+        "stdout_level": SelectOption("TRACE", ["TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]),
         "output": SelectOption(["stdout", "stderr", "file"], ["stdout", "stderr", "file"], multi=True),
         "module": False,
     },

@@ -1287,6 +1287,7 @@ def setup_logging():
     # 从配置读取
     log_config = core_config.get_config("log")
     LEVEL: str = log_config.get("level", "INFO").upper()
+    STDOUT_LEVEL: str = str(log_config.get("stdout_level", "TRACE")).upper()
     logger_list: List[str] = log_config.get("output", ["stdout", "stderr", "file"])
 
     # 处理器链共享基础部分：pathname→plugin 与 emoji 统一装配，三端保持一致。
@@ -1365,6 +1366,9 @@ def setup_logging():
     if "stdout" in logger_list:
         stdout_handler = logging.StreamHandler(sys.stdout)
         stdout_handler.setLevel(LEVEL)
+        stdout_floor = logging.getLevelName(STDOUT_LEVEL)
+        if isinstance(stdout_floor, int) and stdout_floor > stdout_handler.level:
+            stdout_handler.setLevel(stdout_floor)
         stdout_handler.setFormatter(structlog.stdlib.ProcessorFormatter(processors=console_processors))
         root_logger.addHandler(stdout_handler)
 
