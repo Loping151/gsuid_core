@@ -26,5 +26,6 @@
   "log.database.write_timeout": "[数据库] 写事务超过 {budget}s，已中止并释放写锁: {operation}",
   "log.database.write_timeout_close_fail": "[数据库] 放弃写事务时关闭连接失败: {e}",
   "log.database.write_timeout_close_hung": "[数据库] 写连接{step}超过期限，先放开写闸门",
-  "log.database.write_timeout_linger": "[数据库] 写事务已中止，但协程仍在运行: {operation}"
+  "log.database.write_timeout_linger": "[数据库] 写事务已中止，但协程仍在运行: {operation}",
+  "log.database.wal_keepalive_fail": "[数据库] 常驻 WAL 连接未能建立，退回每次会话关闭即 checkpoint: {e}"
 }

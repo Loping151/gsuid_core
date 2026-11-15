@@ -191,3 +191,56 @@ def test_restart_env_guard_and_supervisor(tmp_path: Path, monkeypatch: pytest.Mo
     commands.clear()
     assert Supervisor(["core"], {}).run() == 3
     assert commands == [["core"], ["core"]]
+
+
+def test_sqlite_wal_keepalive_keeps_wal_and_allows_checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """常驻连接开着时，会话关闭不再删建 -wal；自动/手动 checkpoint 仍能完成；关掉后 WAL 正常清理。"""
+    import sqlite3
+
+    db = tmp_path / "keepalive.db"
+    wal = Path(str(db) + "-wal")
+    base_models._enable_sqlite_wal(str(db))
+    conn = sqlite3.connect(str(db))
+    conn.execute("CREATE TABLE t(x)")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(base_models, "_sqlite_wal_keepalive_conn", None)
+
+    def session_write(value: int) -> None:
+        conn = sqlite3.connect(str(db))
+        conn.execute("INSERT INTO t VALUES (?)", (value,))
+        conn.commit()
+        conn.close()
+
+    # 没有常驻连接：每个会话关闭都是最后一条连接，WAL 被删
+    session_write(0)
+    assert not wal.exists()
+
+    base_models._open_sqlite_wal_keepalive(str(db))
+    try:
+        keepalive = base_models._sqlite_wal_keepalive_conn
+        assert keepalive is not None
+        base_models._open_sqlite_wal_keepalive(str(db))  # 重复调用不另开
+        assert base_models._sqlite_wal_keepalive_conn is keepalive
+
+        inodes = set()
+        for i in range(1, 21):
+            session_write(i)
+            assert wal.exists()
+            inodes.add(wal.stat().st_ino)
+        assert len(inodes) == 1
+
+        # 常驻连接不持有读事务，不挡 checkpoint
+        conn = sqlite3.connect(str(db))
+        busy, log_frames, checkpointed = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+        conn.close()
+        assert busy == 0 and log_frames == checkpointed
+    finally:
+        base_models._close_sqlite_wal_keepalive()
+
+    assert base_models._sqlite_wal_keepalive_conn is None
+    assert not wal.exists()
+    conn = sqlite3.connect(str(db))
+    assert conn.execute("SELECT count(*) FROM t").fetchone()[0] == 21
+    conn.close()
+    base_models._close_sqlite_wal_keepalive()  # 已关闭时再调不报错

@@ -80,4 +80,9 @@ DATABASE_CONIFG: Dict[str, GSC] = {
         "NORMAL",
         ["NORMAL", "FULL", "OFF"],
     ),
+    "sqlite_wal_keepalive": GsBoolConfig(
+        "SQLite常驻连接保持WAL",
+        "常驻一条空闲连接，避免每次会话关闭都checkpoint并删建WAL/SHM(大幅减少磁盘写入和fsync)",
+        True,
+    ),
 }

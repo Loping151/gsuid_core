@@ -26,5 +26,6 @@
   "log.database.write_timeout": "[Database] Write exceeded {budget}s and was aborted to release the write lock: {operation}",
   "log.database.write_timeout_close_fail": "[Database] Failed to close the connection while aborting a write: {e}",
   "log.database.write_timeout_close_hung": "[Database] Write connection {step} exceeded the deadline; releasing the write gate",
-  "log.database.write_timeout_linger": "[Database] Write was aborted, but the coroutine is still running: {operation}"
+  "log.database.write_timeout_linger": "[Database] Write was aborted, but the coroutine is still running: {operation}",
+  "log.database.wal_keepalive_fail": "[Database] Failed to open the WAL keepalive connection, falling back to checkpoint on every session close: {e}"
 }

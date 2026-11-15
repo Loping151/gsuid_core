@@ -1,3 +1,4 @@
+import atexit
 import asyncio
 import sqlite3
 import contextlib
@@ -72,6 +73,9 @@ sqlite_cache_size: int = _sqlite_cache_size_cfg.data if _sqlite_cache_size_cfg i
 _sqlite_sync_cfg = database_config.get_config("sqlite_synchronous")
 sqlite_synchronous: str = _sqlite_sync_cfg.data if _sqlite_sync_cfg is not None else "NORMAL"
 
+_sqlite_keepalive_cfg = database_config.get_config("sqlite_wal_keepalive")
+sqlite_wal_keepalive: bool = _sqlite_keepalive_cfg.data if _sqlite_keepalive_cfg is not None else True
+
 _db_type = db_type.lower()
 db_config = {
     "pool_recycle": db_pool_recycle,
@@ -90,8 +94,12 @@ sqlite_read_semaphore = None
 
 # 建连超时。journal_mode 只在启动时设一次，避免每条连接在别人持写锁时立刻失败。
 _SQLITE_BUSY_MS = 5000
+# 常驻连接让 -wal 一直存在；checkpoint 后 WAL 超过这个大小才截回来，偶发的大事务不会永久占着空间。
+_SQLITE_JOURNAL_SIZE_LIMIT = 64 * 1024 * 1024
 _SQLITE_TIMEOUT_S = 5.0
 _UPSERT_CHUNK = 400
+# 见 _open_sqlite_wal_keepalive
+_sqlite_wal_keepalive_conn: sqlite3.Connection | None = None
 
 
 class _WriteBinding:
@@ -259,7 +267,42 @@ def _set_sqlite_connect_pragmas(dbapi_connection: sqlite3.Connection, _connectio
     cursor.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_MS}")
     cursor.execute(f"PRAGMA synchronous={sqlite_synchronous}")
     cursor.execute(f"PRAGMA cache_size={sqlite_cache_size}")
+    cursor.execute(f"PRAGMA journal_size_limit={_SQLITE_JOURNAL_SIZE_LIMIT}")
     cursor.close()
+
+
+def _open_sqlite_wal_keepalive(db_path: str) -> None:
+    """常驻一条空闲连接，让 -wal/-shm 不随会话关闭反复 checkpoint 和删建。
+
+    NullPool 下每个会话关闭时都是"最后一条连接"：SQLite 会做完整 checkpoint、fsync，
+    再删掉 -wal/-shm，下一个会话重新建。线上实测每分钟删建约 1800 次、fsync 约 870 次，
+    系统盘每天因此多写几十 GB。只要有一条连接开着并做过一次读（WAL 模式下读过的连接
+    会一直持有库文件的共享锁），会话关闭就不再触发这套流程，WAL 交给自动 checkpoint
+    （默认满 1000 页）。这条连接不开事务，不挡 checkpoint；进程退出时由 atexit 关闭，
+    最后一次关闭照常 checkpoint 并清理 WAL。
+    """
+    global _sqlite_wal_keepalive_conn
+    if _sqlite_wal_keepalive_conn is not None:
+        return
+    conn = sqlite3.connect(db_path, timeout=_SQLITE_TIMEOUT_S, check_same_thread=False, isolation_level=None)
+    try:
+        conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_MS}")
+        conn.execute(f"PRAGMA journal_size_limit={_SQLITE_JOURNAL_SIZE_LIMIT}")
+        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchall()
+    except BaseException:
+        conn.close()
+        raise
+    _sqlite_wal_keepalive_conn = conn
+    atexit.register(_close_sqlite_wal_keepalive)
+
+
+def _close_sqlite_wal_keepalive() -> None:
+    global _sqlite_wal_keepalive_conn
+    conn, _sqlite_wal_keepalive_conn = _sqlite_wal_keepalive_conn, None
+    if conn is None:
+        return
+    with contextlib.suppress(sqlite3.Error):
+        conn.close()
 
 
 async def _mark_read_only(session: AsyncSession) -> None:
@@ -285,6 +328,11 @@ async def init_database():
                 # 默认 QueuePool 会在等写锁时占满槽（2026-07 雪崩）。NullPool + 单写者闸门。
                 # sqlite3.connect 会堵满 busy_timeout，不能占着事件循环。
                 await asyncio.to_thread(_enable_sqlite_wal, db_url)
+                if sqlite_wal_keepalive:
+                    try:
+                        await asyncio.to_thread(_open_sqlite_wal_keepalive, db_url)
+                    except sqlite3.Error as e:
+                        logger.warning(i18n_t("log.database.wal_keepalive_fail", e=e))
                 db_config.update(
                     {
                         "connect_args": {

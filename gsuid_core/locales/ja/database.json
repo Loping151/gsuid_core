@@ -26,5 +26,6 @@
   "log.database.write_timeout": "[データベース] 書き込みが {budget}s を超えたため中止し、書き込みロックを解放した: {operation}",
   "log.database.write_timeout_close_fail": "[データベース] 書き込み中止時に接続を閉じられなかった: {e}",
   "log.database.write_timeout_close_hung": "[データベース] 書き込み接続の {step} が期限を超えたため、先にゲートを解放した",
-  "log.database.write_timeout_linger": "[データベース] 書き込みは中止したが、コルーチンはまだ動いている: {operation}"
+  "log.database.write_timeout_linger": "[データベース] 書き込みは中止したが、コルーチンはまだ動いている: {operation}",
+  "log.database.wal_keepalive_fail": "[データベース] WAL 常駐接続を確立できず、セッション終了ごとの checkpoint に戻る: {e}"
 }
